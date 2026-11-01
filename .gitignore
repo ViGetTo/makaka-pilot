@@ -1,0 +1,9 @@
+node_modules/
+.env
+*.session
+*.log
+launch.json
+status.json
+browser/
+.state/
+.makaka-update.lock

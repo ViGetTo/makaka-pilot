@@ -1,0 +1,10 @@
+{
+  "name": "makaka-pilot-termux",
+  "version": "2.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Запуск Makaka Pilot в Termux с обновлением через GitHub",
+  "engines": { "node": ">=22.12.0" },
+  "scripts": { "start": "node run.mjs", "test": "node --test test/*.test.mjs test/*.test.cjs" },
+  "dependencies": { "puppeteer-core": "25.16.0" }
+}
