@@ -13,6 +13,8 @@ import { tuneFarm } from './lib/tuning.mjs';
 import { probeFastRestart } from './lib/probe.mjs';
 import { createTelegramProvider, telegramCredentials } from './lib/telegram.mjs';
 import { gameAuthError, saveTelegramLaunch, withRenewedLaunch } from './lib/launch.mjs';
+import { createRankings } from './lib/leaderboard.mjs';
+import { createConsoleView } from './lib/terminal.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const stateDir = resolve(process.env.MAKAKA_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'makaka-pilot'));
@@ -62,14 +64,13 @@ async function telegramLogin() {
 
 async function configure() {
   const previous = await readJson(configPath, {}), opts = automaticSessionOptions(previous.options);
-  console.log('Автомат: фарм и попытка волны каждые 3 минуты. makaka farm — только фарм.');
-  for (const [key, label, max] of [ ['reserve', 'Резерв бананов', 1e15],
-    ['farmKills', 'Пачка убийств (0 — авто)', 1000], ['sessionMinutes', 'Длительность, минут (0 — без конца)', 1440] ]) {
+  console.log('Автомат: волны подряд, при отказе — фарм бананов 3 минуты. Урон покупается при наличии денег.');
+  for (const [key, label, max] of [ ['farmKills', 'Пачка убийств (0 — авто)', 1000],
+    ['sessionMinutes', 'Длительность, минут (0 — без конца)', 1440] ]) {
     const n = Number(await question(`${label} [${opts[key]}]: `, String(opts[key])));
     if (!Number.isFinite(n) || n < 0 || n > max) throw new Error('Недопустимое число. Настройки не изменены.');
     opts[key] = Math.floor(n);
   }
-  opts.autoUpgrade = (await question('Покупать одно боевое улучшение перед попыткой? Y/n: ', opts.autoUpgrade ? 'y' : 'n')).toLowerCase() === 'y';
   opts.gearAuto = false;
   await privateJson(configPath, { ...previous, options: opts });
   console.log('Настройки сохранены. Запуск: makaka');
@@ -117,17 +118,25 @@ async function run(checkOnly = false, tuning = false, probing = false) {
   let url = config.authMode === 'telegram' ? null : validateLaunchUrl(config.url);
   const executablePath = await browserPath();
   await acquire();
-  let browser, page, provider, stopping = false, last = null, terminalError = false, sessionDeadline = null;
+  let browser, page, provider, view, stopping = false, last = null, terminalError = false, sessionDeadline = null;
+  const rankings = createRankings();
   const stop = () => { stopping = true; };
   const stopped = async () => stopping || !!await readJson(stopPath, false);
   const closePage = async () => {
     if (page && !page.isClosed()) {
       try {
-        const s = await page.evaluate(() => { window.MakakaPilot?.stop('Остановлено из Termux.'); return window.MakakaPilot?.status(); });
-        if (s) await privateJson(statusPath, safeStatus(s));
+        const s = await page.evaluate(() => { window.MakakaPilot?.stop('Закрываю игровую сессию.'); return window.MakakaPilot?.status(); });
+        if (s) {
+          const finalStatus = { ...safeStatus(s), rankings: rankings.snapshot() };
+          view?.update(finalStatus);
+          await privateJson(statusPath, finalStatus);
+        }
       } catch {}
+      view?.close(); view = null;
       await page.close().catch(() => {});
     }
+    view?.close(); view = null;
+    rankings.reset();
     page = null;
   };
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
@@ -214,15 +223,15 @@ async function run(checkOnly = false, tuning = false, probing = false) {
             const ok = await page.evaluate(options => window.MakakaPilot.start(options), options);
             if (!ok) throw new Error('Движок игры не обнаружен. Фарм не запущен.');
           }
-          console.log(checkOnly ? 'Запуск игры проверен. Бой не включался.' : 'Работает. Остановить: Ctrl+C или makaka stop в другой сессии.');
-          let tick = 0;
+          if (checkOnly) console.log('Запуск игры проверен. Бой не включался.');
+          view = createConsoleView();
           do {
             if (!browser.connected) throw new Error('Браузер завершился. Проверь ограничения фоновой работы Android.');
             if (provider && await provider.keepAlive()) throw gameAuthError();
-            last = safeStatus(await page.evaluate(() => window.MakakaPilot.status()));
+            rankings.refresh(page).catch(() => {});
+            last = { ...safeStatus(await page.evaluate(() => window.MakakaPilot.status())), rankings: rankings.snapshot() };
             await privateJson(statusPath, last);
-            if (tick++ % 5 === 0 || !last.active || checkOnly) console.log(
-              `Бананы: ${last.server?.bananas ?? '?'} | рекорд: ${last.server?.bestWave ?? '?'} | бой: ${last.battle?.wave ?? '-'} ${last.battle?.killed ?? 0}/${last.battle?.total ?? '-'} | ${last.incomePerMinute ?? 0}/мин | ${last.automation ? 'Автомат: ' + ({ farm: 'фарм', prepare: 'подготовка', push: 'попытка волны', retreat: 'возврат к фарму' }[last.automation.stage] || last.automation.stage) + ', до попытки ' + last.automation.nextAttemptSeconds + ' с. ' : ''}${last.message || ''}`);
+            view.update(last);
             if (checkOnly || stopping || !last.active || terminalError) break;
             if (await readJson(stopPath, false)) { stopping = true; break; }
             await delay(1000);
@@ -248,7 +257,8 @@ try {
   else if (command === 'config') await configure();
   else if (command === 'status') {
     const status = await readJson(statusPath);
-    console.log(status ? JSON.stringify(status, null, 2) : 'Пока нет сохранённого статуса. Запуск: makaka');
+    if (status) { const view = createConsoleView(); view.update(status); view.close(); }
+    else console.log('Пока нет сохранённого статуса. Запуск: makaka');
   } else if (command === 'stop') {
     if (!await readJson(lockPath)) console.log('Скрипт не запущен.');
     else { await privateJson(stopPath, { requestedAt: new Date().toISOString() }); console.log('Запрос остановки отправлен.'); }

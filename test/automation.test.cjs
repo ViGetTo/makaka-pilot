@@ -1,82 +1,87 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const browser = require('./helpers/browser.cjs');
+const ticks = async (b, count = 5) => { for (let i = 0; i < count; i++) await b.advance(); };
 
-test('auto farms first, finishes a confirmed prefix, and only then attempts a wave after three minutes', async () => {
+test('auto starts passing waves immediately with native damage and does not stop at old bank targets', async () => {
   const b = browser();
-  b.start({ farmTarget: 1, targetWave: 60 });
-  await b.advance(179900);
-  assert.equal(b.pilot.status().active, true);
-  assert.equal(b.pilot.status().automation.stage, 'farm');
-  assert.equal(b.sent.some(r => r.path === '/api/upgrade'), false);
-  await b.advance();
-  assert.equal(b.pilot.status().automation.stage, 'prepare');
-  assert.equal(b.pilot.status().automation.combatMode, 'farmer');
-  b.engine.killed = 2;
-  for (let i = 0; i < 5; i++) await b.advance();
+  await b.enterPush({ farmTarget: 1, targetWave: 60 });
   const s = b.pilot.status();
-  assert.equal(s.automation.stage, 'push'); assert.equal(s.automation.attempts, 1);
-  assert.equal(s.automation.combatMode, 'paced'); assert.equal(s.active, true);
-  assert.equal(s.stats.farmCycles, 1);
-  assert.equal(b.sent.filter(r => r.path.endsWith('/start')).length, 2);
+  assert.equal(s.active, true); assert.equal(s.automation.stage, 'push');
+  assert.equal(s.automation.combatMode, 'survival'); assert.equal(s.automation.attempts, 1);
+  assert.equal(s.stats.farmCycles, 0);
+  assert.equal(b.sent.some(r => r.path === '/api/upgrade'), false, 'an affordable critical upgrade must not replace saving for damage');
 });
 
-test('a server rejection cancels the old clear and resumes farming without stopping the runner', async () => {
+test('a rejected wave farms for three minutes, finishes its prefix and retries without reviving the old clear', async () => {
   const b = browser(); await b.enterPush();
   let oldResolved = false;
   const { promise } = await b.clear(); promise.then(() => { oldResolved = true; });
-  assert.equal(b.sent.filter(r => r.path.endsWith('/clear')).length, 0, 'clear must honor the real-time gate');
-  await b.advance(11000);
-  for (let i = 0; i < 4; i++) await b.advance();
+  await b.flush(); await ticks(b);
   let s = b.pilot.status();
   assert.equal(s.active, true); assert.equal(s.automation.stage, 'farm');
   assert.equal(s.automation.history.at(-1).result, 'too_fast');
   assert.equal(s.server.bestWave, 64); assert.equal(oldResolved, false);
   assert.equal(b.sent.filter(r => r.path.endsWith('/clear')).length, 1);
-  await b.advance(s.automation.nextAttemptSeconds * 1000 - 1000);
+  const untilRetry = s.automation.nextAttemptAt - b.context.Date.now();
+  await b.advance(untilRetry - 100);
+  assert.equal(b.pilot.status().automation.stage, 'farm');
+  await b.advance();
+  assert.equal(b.pilot.status().automation.stage, 'prepare');
+  assert.equal(b.pilot.status().automation.combatMode, 'farmer');
+  b.engine.killed = 2; await ticks(b);
   s = b.pilot.status();
-  assert.equal(s.automation.stage, 'farm'); assert.equal(s.automation.attempts, 1);
-  b.engine.killed = 2;
-  for (let i = 0; i < 5; i++) await b.advance();
-  await b.advance(1000);
-  for (let i = 0; i < 5; i++) await b.advance();
-  assert.equal(b.pilot.status().automation.attempts, 2);
-  assert.equal(oldResolved, false, 'an old clear must not resolve against the restarted wave');
+  assert.equal(s.automation.stage, 'push'); assert.equal(s.automation.attempts, 2);
+  assert.equal(s.stats.farmCycles, 1); assert.equal(oldResolved, false);
   assert.equal(b.sent.filter(r => r.path.endsWith('/clear')).length, 1);
 });
 
-test('an accepted wave returns to farming the next wave and keeps the three-minute schedule', async () => {
+test('accepted waves start the next wave immediately and continue passing without a farming cooldown', async () => {
   const b = browser({ clearAccepted: true }); await b.enterPush();
-  const nextAttempt = b.pilot.status().automation.nextAttemptAt;
-  const { promise } = await b.clear();
-  await b.advance(11000); await promise; await b.flush();
+  for (const wave of [65, 66]) {
+    const { promise } = await b.clear(); await promise; await b.flush();
+    assert.equal(b.pilot.status().server.bestWave, wave);
+    assert.equal(b.pilot.status().automation.stage, 'prepare');
+    await b.advance(); await b.advance(2800);
+    assert.equal(b.pilot.status().automation.stage, 'push');
+    assert.equal(b.pilot.status().battle.wave, wave + 1);
+    assert.equal(b.pilot.status().automation.nextAttemptSeconds, null);
+  }
   const s = b.pilot.status();
-  assert.equal(s.active, true); assert.equal(s.server.bestWave, 65);
-  assert.equal(s.automation.stage, 'farm'); assert.equal(s.automation.combatMode, 'farmer');
-  assert.equal(s.automation.nextAttemptAt, nextAttempt);
-  assert.equal(s.automation.history.at(-1).result, 'cleared');
+  assert.equal(s.automation.attempts, 3); assert.equal(s.stats.farmCycles, 0);
+  assert.equal(b.sent.some(r => r.path.endsWith('/fail')), false);
 });
 
-test('a clear already in flight is allowed to finish before any exit and a delayed success resumes farming', async () => {
+test('a damage rejection also parks the native clear and falls back to farming immediately', async () => {
+  const b = browser({ clearError: 'damage_too_low', clearStatus: 400 }); await b.enterPush();
+  const { promise } = await b.clear(); let resolved = false; promise.then(() => { resolved = true; });
+  await b.flush(); await ticks(b);
+  const s = b.pilot.status();
+  assert.equal(s.automation.stage, 'farm'); assert.equal(s.automation.history.at(-1).result, 'damage_too_low');
+  assert.equal(s.active, true); assert.equal(resolved, false);
+  assert.ok(s.automation.nextAttemptSeconds >= 179);
+  assert.equal(b.sent.filter(r => r.path.endsWith('/clear')).length, 1);
+});
+
+test('a delayed accepted clear is not cancelled by a simultaneous timeout retreat', async () => {
   const b = browser({ clearAccepted: true, holdClear: true }); await b.enterPush();
-  const { promise } = await b.clear(); await b.advance(11000);
+  const { promise } = await b.clear(); await b.flush();
   assert.equal(b.pilot.status().clearInFlight, 1);
   await b.advance(90000);
   assert.equal(b.pilot.status().automation.stage, 'retreat');
   assert.equal(b.sent.some(r => r.path.endsWith('/fail')), false);
   b.releaseClear(); await promise; await b.flush();
   const s = b.pilot.status();
-  assert.equal(s.automation.stage, 'farm'); assert.equal(s.active, true);
+  assert.equal(s.automation.stage, 'prepare'); assert.equal(s.active, true);
   assert.equal(s.server.bestWave, 65);
   assert.equal(s.automation.history.at(-1).result, 'cleared');
   assert.equal(b.sent.some(r => r.path.endsWith('/fail')), false);
 });
 
-test('missing kill confirmation cannot trap a locally cleared attempt for fifteen minutes', async () => {
+test('missing kill confirmation returns to farming after ninety seconds instead of hanging for fifteen minutes', async () => {
   const b = browser({ killLimit: 1 }); await b.enterPush();
   const { promise } = await b.clear(); let resolved = false; promise.then(() => { resolved = true; });
-  await b.advance(90000);
-  for (let i = 0; i < 4; i++) await b.advance();
+  await b.advance(90000); await ticks(b);
   const s = b.pilot.status();
   assert.equal(s.active, true); assert.equal(s.automation.stage, 'farm');
   assert.equal(s.automation.history.at(-1).result, 'timeout');
@@ -85,22 +90,50 @@ test('missing kill confirmation cannot trap a locally cleared attempt for fiftee
   assert.equal(b.sent.some(r => r.path.endsWith('/clear')), false);
 });
 
-test('one affordable upgrade is bought per attempt and the reserve is honored', async () => {
-  const b = browser(); await b.enterPush({ autoUpgrade: true });
-  assert.equal(b.sent.filter(r => r.path === '/api/upgrade').length, 1);
-  for (let i = 0; i < 4; i++) await b.advance();
-  assert.equal(b.sent.filter(r => r.path === '/api/upgrade').length, 1);
-  assert.equal(b.pilot.status().stats.spent, 100);
-  const reserved = browser(); await reserved.enterPush({ autoUpgrade: true, reserve: 1000000 });
-  assert.equal(reserved.sent.filter(r => r.path === '/api/upgrade').length, 0);
-  assert.equal(reserved.pilot.status().automation.stage, 'push');
+test('damage is purchased repeatedly as soon as affordable, including during combat and with obsolete disabled settings', async () => {
+  const b = browser({ damageCost: 100, bananas: 1000 });
+  b.start({ autoUpgrade: false, reserve: 1000000 });
+  await b.advance(); await b.advance(1100);
+  assert.equal(b.pilot.status().automation.stage, 'push');
+  await b.advance(1200); await b.advance(1200); await b.advance(1200);
+  let purchases = b.sent.filter(r => r.path === '/api/upgrade');
+  assert.equal(purchases.length, 3); assert.ok(purchases.every(r => r.body.kind === 'dmg'));
+  let s = b.pilot.status();
+  assert.equal(s.server.bananas, 300); assert.equal(s.server.upgrades.dmg.level, 4);
+  assert.equal(s.stats.spent, 700); assert.equal(s.stats.damageUpgrades, 3);
+  assert.equal(s.config.autoUpgrade, true); assert.equal(s.config.reserve, 0);
+  await b.earn(500); await b.advance(1200);
+  s = b.pilot.status(); purchases = b.sent.filter(r => r.path === '/api/upgrade');
+  assert.equal(purchases.length, 4); assert.equal(s.server.bananas, 0);
+  assert.equal(s.stats.spent, 1500);
 });
 
-test('manual stop stays stopped and a configured session deadline spans all automatic stages', async () => {
+test('saving for damage continues during farming and a funded upgrade does not wait for the next attempt', async () => {
+  const b = browser(); await b.enterPush();
+  await b.clear(); await b.flush(); await ticks(b);
+  assert.equal(b.pilot.status().automation.stage, 'farm');
+  await b.earn(2000000); await b.advance(1200);
+  assert.equal(b.sent.filter(r => r.path === '/api/upgrade').length, 1);
+  assert.equal(b.pilot.status().automation.stage, 'farm');
+  assert.equal(b.pilot.status().stats.damageUpgrades, 1);
+});
+
+test('a farming confirmation timeout does not postpone the scheduled progression retry', async () => {
+  const b = browser({ killLimit: 1 }); await b.enterPush();
+  await b.clear(); await b.advance(90000); await ticks(b);
+  const deadline = b.pilot.status().automation.nextAttemptAt;
+  b.engine.killed = 2; await b.advance();
+  await b.advance(30000); await ticks(b);
+  assert.equal(b.pilot.status().automation.nextAttemptAt, deadline);
+  assert.equal(b.pilot.status().active, true);
+});
+
+test('manual stop stays stopped and a finite session deadline spans passing and farming stages', async () => {
   const b = browser(); await b.enterPush(); b.pilot.stop();
   const requests = b.sent.length; await b.advance(180000);
   assert.equal(b.pilot.status().active, false); assert.equal(b.sent.length, requests);
-  const timed = browser(); timed.start({ sessionMinutes: 4 });
-  await timed.advance(180000); assert.equal(timed.pilot.status().automation.stage, 'push');
-  await timed.advance(60000); assert.equal(timed.pilot.status().active, false);
+  const timed = browser(); timed.start({ sessionMinutes: 4 }); await timed.advance();
+  await timed.advance(90000); await ticks(timed);
+  assert.equal(timed.pilot.status().automation.stage, 'farm');
+  await timed.advance(150000); assert.equal(timed.pilot.status().active, false);
 });

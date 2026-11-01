@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.9.0
+// @version      2.10.0
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.9.0';
+  const VERSION = '2.10.0';
   const AUTO_INTERVAL = 180000, AUTO_TIMEOUT = 90000;
   const DEFAULTS = {
     mode: 'auto', speed: 8, autoUpgrade: true, mine: true,
@@ -28,13 +28,14 @@
   function cleanConfig(value = {}) {
     const finite = (x, fallback, min, max) =>
       Number.isFinite(Number(x)) ? Math.min(max, Math.max(min, Number(x))) : fallback;
+    const mode = MODES.has(value.mode) ? value.mode : DEFAULTS.mode;
     return {
-      mode: MODES.has(value.mode) ? value.mode : DEFAULTS.mode,
+      mode,
       speed: finite(value.speed ?? DEFAULTS.speed, DEFAULTS.speed, 1, 8),
-      autoUpgrade: value.autoUpgrade ?? DEFAULTS.autoUpgrade,
+      autoUpgrade: mode === 'auto' ? true : (value.autoUpgrade ?? DEFAULTS.autoUpgrade),
       mine: value.mine ?? DEFAULTS.mine,
       collect: value.collect ?? DEFAULTS.collect,
-      reserve: finite(value.reserve ?? 0, 0, 0, 1e15),
+      reserve: mode === 'auto' ? 0 : finite(value.reserve ?? 0, 0, 0, 1e15),
       targetWave: Math.floor(finite(value.targetWave ?? 0, 0, 0, 1e9)),
       sessionMinutes: finite(value.sessionMinutes ?? 0, 0, 0, 1440),
       farmTarget: finite(value.farmTarget ?? 0, 0, 0, 1e15),
@@ -76,6 +77,11 @@
     if (best && best.cost > available && available >= best.cost * 0.75 &&
         (!affordable[0] || best.score > affordable[0].score * 1.25)) return null;
     return affordable[0] || null;
+  }
+
+  function chooseDamageUpgrade(state) {
+    const cost = state?.upgrades?.dmg?.cost;
+    return Number.isFinite(cost) && cost > 0 && state.bananas >= cost ? { kind: 'dmg', cost } : null;
   }
 
   function energyAt(state, now) {
@@ -233,7 +239,7 @@
     };
   }
 
-  const Core = { cleanConfig, combatChoices, chooseCombatUpgrade, energyAt, tapCount,
+  const Core = { cleanConfig, combatChoices, chooseCombatUpgrade, chooseDamageUpgrade, energyAt, tapCount,
     economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, farmLocalLimit, WRITABLE };
   if (typeof module === 'object' && module.exports) {
     module.exports = Core;
@@ -260,7 +266,7 @@
   } catch { /* Authorization remains in memory and can be learned from game requests. */ }
 
   const stats = { blockedDamage: 0, burstShots: 0, requests: 0, failures: 0,
-    spent: 0, gained: 0, startBest: null, best: null, starts: 0, farmCycles: 0 };
+    spent: 0, gained: 0, startBest: null, best: null, starts: 0, farmCycles: 0, damageUpgrades: 0 };
   const log = [];
   let active = false, installed = true, engine = null, bridge = null, restore = null;
   let latest = null, stateSkew = 0, baselineBalance = null;
@@ -285,12 +291,12 @@
   let nativeExit = null, exiting = false, stepping = false, clearInFlight = 0;
   let runtimeFarmKills = 0;
   const battleWaiters = new Set();
-  const automatic = { stage: 'farm', nextAttemptAt: 0, deadlineAt: 0,
-    attempts: 0, wave: null, rejection: null, retreatAt: 0, exitRequested: false, history: [] };
+  const automatic = { stage: 'prepare', nextAttemptAt: 0, deadlineAt: 0,
+    attempts: 0, wave: null, rejection: null, retreatAt: 0, exitRequested: false, cooldownAfterExit: false, history: [] };
   function combatConfig() {
     if (cfg.mode !== 'auto') return cfg;
     const push = automatic.stage === 'push';
-    return { ...cfg, mode: push ? 'paced' : 'farmer', speed: push ? 1 : 8,
+    return { ...cfg, mode: push ? 'survival' : 'farmer', speed: push ? 1 : 8,
       farmKills: runtimeFarmKills || cfg.farmKills, retreating: automatic.stage === 'retreat' };
   }
   function cancelBattle() {
@@ -490,16 +496,22 @@
               if (trials.length > 100) trials.shift();
             }
           }
+          if (cfg.mode === 'auto' && automatic.stage === 'push' && response.status >= 400 && response.status < 500 &&
+              ![401, 403, 429].includes(response.status)) {
+            const error = await response.clone().json().catch(() => ({}));
+            if (error.error !== 'stale_wave') {
+              automatic.rejection = String(error.error || 'rejected');
+              lastBattleError = { path, status: response.status, code: automatic.rejection,
+                message: String(error.message || ''), at: new Date().toISOString() };
+              note('Сервер отклонил волну. Возвращаюсь к фарму бананов.');
+              return parked();
+            }
+          }
           if (response.status !== 409) { waitingForKills = false; return response; }
           const error = await response.clone().json().catch(() => ({}));
           if (error.error !== 'too_fast') { waitingForKills = false; return response; }
           lastBattleError = { path, status: response.status, code: error.error,
             message: String(error.message || ''), at: new Date().toISOString() };
-          if (cfg.mode === 'auto' && automatic.stage === 'push') {
-            automatic.rejection = 'too_fast';
-            note('Сервер отклонил волну. Возвращаюсь к фарму.');
-            return parked();
-          }
           if (Date.now() >= until) {
             waitingForKills = false; stop('Сервер не принял завершение волны за 15 минут.');
             return response;
@@ -547,6 +559,7 @@
             totalHp: data.wave.cats.reduce((sum, cat) => sum + cat.hp, 0),
             count: data.wave.cats.length, gap: data.wave.gap, attempts: [], killProgress: [] };
           if (cfg.mode === 'auto' && automatic.stage === 'push') {
+            automatic.attempts++;
             automatic.wave = data.wave.wave;
             automatic.deadlineAt = Date.now() + AUTO_TIMEOUT;
           }
@@ -641,6 +654,23 @@
       busy = false;
     }
   }
+  function maintainDamage(now) {
+    if (busy || now < nextRequest || now < upgradeAt || !authorization || needsSync) return;
+    const choice = chooseDamageUpgrade(latest);
+    if (!choice) return;
+    const level = latest.upgrades.dmg.level, damage = latest.stats.dmg;
+    upgradeAt = now + 1200;
+    request('/api/upgrade', { kind: 'dmg' }).then(result => {
+      if (!result) return;
+      if (result.state?.upgrades?.dmg?.level > level || result.state?.stats?.dmg > damage) {
+        stats.spent += choice.cost; stats.damageUpgrades++;
+        note('Повышен урон: уровень ' + (result.state.upgrades?.dmg?.level ?? '—') + ', урон ' + (result.state.stats?.dmg ?? '—') + '.');
+      } else {
+        needsSync = true; upgradeAt = Date.now() + 30000;
+        note('Сервер ещё не подтвердил улучшение урона. Проверяю состояние.');
+      }
+    });
+  }
   function visibleButton(match) {
     return [...document.querySelectorAll('button')].find(b =>
       b.getClientRects().length && !b.disabled && match(b.innerText.trim(), b));
@@ -653,14 +683,19 @@
     automatic.history.push({ at: new Date().toISOString(), result,
       wave: automatic.wave, bananas: latest?.bananas, bestWave: stats.best });
     if (automatic.history.length > 100) automatic.history.shift();
-    automatic.stage = 'farm'; automatic.deadlineAt = 0; automatic.wave = null;
+    const cleared = result === 'cleared';
+    automatic.stage = cleared ? 'prepare' : 'farm'; automatic.deadlineAt = 0; automatic.wave = null;
+    automatic.nextAttemptAt = cleared ? 0 : automatic.cooldownAfterExit || !automatic.nextAttemptAt
+      ? Date.now() + AUTO_INTERVAL : automatic.nextAttemptAt;
+    automatic.cooldownAfterExit = false;
     automatic.rejection = null; automatic.exitRequested = false;
     savingUntil = 0;
     minimumTransition = 0; actionAt = Date.now() + 100;
-    note(result === 'cleared' ? 'Сервер принял волну. Продолжаю фарм до следующей попытки.' :
-      'Попытка завершена (' + result + '). Продолжаю фарм до следующей проверки.');
+    note(cleared ? 'Сервер принял волну. Прохожу следующую.' :
+      'Перехожу к фарму бананов. Следующая проверка через 3 минуты.');
   }
   function retreatAutomatic(reason, now) {
+    automatic.cooldownAfterExit = automatic.stage === 'push';
     automatic.stage = 'retreat'; automatic.rejection = reason; automatic.retreatAt = now;
     automatic.exitRequested = false; automatic.pauseRequestedAt = 0; automatic.invalidated = false;
     note('Возвращаюсь к фарму: ' + reason + '.');
@@ -690,7 +725,7 @@
       finishAutomatic('cleared');
     }
     if (automatic.stage === 'push') {
-      if (automatic.rejection || engine.phase === 'failed' || now >= automatic.deadlineAt) {
+      if (automatic.rejection || engine.phase === 'failed' && automatic.wave !== null || now >= automatic.deadlineAt) {
         retreatAutomatic(automatic.rejection || (engine.phase === 'failed' ? 'failed' : 'timeout'), now);
       }
     }
@@ -713,20 +748,12 @@
         if (result) needsSync = false;
         return true;
       }
-      const choice = cfg.autoUpgrade ? chooseCombatUpgrade(latest, 1, cfg.reserve) : null;
-      if (choice) {
-        const result = await request('/api/upgrade', { kind: choice.kind });
-        if (!active) return true;
-        if (!result) return true;
-        stats.spent += choice.cost;
-        note('Перед попыткой куплено одно улучшение: ' + choice.kind + '.');
-      }
       if (!active || cfg.mode !== 'auto') return true;
-      automatic.stage = 'push'; automatic.attempts++; automatic.wave = null;
-      automatic.nextAttemptAt = Date.now() + AUTO_INTERVAL;
+      automatic.stage = 'push'; automatic.wave = null;
+      automatic.nextAttemptAt = 0;
       automatic.deadlineAt = Date.now() + AUTO_TIMEOUT;
       automatic.rejection = null;
-      note('Пробую пройти одну волну. Лимит попытки — 90 секунд.');
+      note('Прохожу волны подряд. Урон покупается по мере накопления.');
     }
     return false;
   }
@@ -773,11 +800,11 @@
     if (!accountingStartedAt) accountingStartedAt = startedAt;
     errors = 0; backoff = 0; nextRequest = 0; recovering = false; failCount = 0;
     runtimeFarmKills = 0;
-    automatic.stage = 'farm'; automatic.nextAttemptAt = startedAt + AUTO_INTERVAL;
+    automatic.stage = 'prepare'; automatic.nextAttemptAt = 0; automatic.cooldownAfterExit = false;
     automatic.deadlineAt = 0; automatic.wave = null; automatic.rejection = null;
     restore?.(); restore = patchEngine(engine, combatConfig, stats);
     disableBuiltinAuto();
-    note(cfg.mode === 'auto' ? 'Автомат: фарм ×8, попытка волны каждые 3 минуты, затем снова фарм.' :
+    note(cfg.mode === 'auto' ? 'Автомат: волны подряд; при отказе — фарм бананов 3 минуты. Покупаю урон при наличии денег.' :
       cfg.mode === 'paced' ? 'Проверка: обычные враги у центра, босс получает урон постепенно.' :
       cfg.mode === 'farmer' ? 'Фармер включён. Покупки отложены до цели накопления.' :
       cfg.mode === 'survival' ? 'Штатная стрельба и защита от урона включены.' :
@@ -800,6 +827,7 @@
     }
     if (hiddenPause) { hiddenPause = false; progressAt = now; }
     if (cfg.mode === 'auto') {
+      maintainDamage(now);
       const handled = await automaticStep(now);
       if (!active) return;
       maintainFarmIncome(now);
@@ -955,16 +983,18 @@
       version: VERSION, active, config: { ...cfg }, message,
       automation: cfg.mode === 'auto' ? { ...automatic, history: automatic.history.slice(),
         combatMode: combatConfig().mode,
-        nextAttemptSeconds: Math.max(0, Math.ceil((automatic.nextAttemptAt - Date.now()) / 1000)) } : null,
+        nextAttemptSeconds: automatic.nextAttemptAt ? Math.max(0, Math.ceil((automatic.nextAttemptAt - Date.now()) / 1000)) : null,
+        attemptSecondsLeft: automatic.deadlineAt ? Math.max(0, Math.ceil((automatic.deadlineAt - Date.now()) / 1000)) : null } : null,
       server: latest ? { wave: latest.battle.wave, bestWave: latest.battle.max_wave,
-        bananas: latest.bananas, upgrades: latest.upgrades } : null,
+        bananas: latest.bananas, upgrades: latest.upgrades, damage: latest.stats.dmg, nextDamage: latest.stats.next?.dmg } : null,
       battle: engine ? { phase: engine.phase, wave: engine.wave?.wave,
-        hp: engine.hp, maxHp: engine.maxHp, killed: engine.killed,
-        total: engine.wave?.cats?.length, paused: !engine.running } : null,
+        hp: engine.hp, maxHp: engine.maxHp, killed: engine.wave ? engine.killed : 0,
+        total: engine.wave?.cats?.length ?? 0, paused: !engine.running } : null,
       stats: { ...stats }, seconds: startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0,
       saveWaitSeconds: Math.max(0, Math.ceil((savingUntil - Date.now()) / 1000)),
       lastBattleError,
-      serverKills: { wave: acceptedWave, counted: acceptedKills, waiting: waitingForKills },
+      serverKills: { wave: acceptedWave, counted: acceptedKills, waiting: waitingForKills,
+        target: combatConfig().mode === 'farmer' ? planForFarm(engine?.wave, combatConfig().speed, combatConfig().farmKills).kills : engine?.wave?.cats?.length },
       farmReportReady: !!reportKills,
       exitReady: !!nativeExit, battleGeneration, clearInFlight,
       currentTrial: trial ? JSON.parse(JSON.stringify(trial)) : null,
@@ -1040,11 +1070,13 @@
     shadow.getElementById('mode').disabled = active;
     shadow.getElementById('speed').disabled = active;
     shadow.getElementById('gearAuto').disabled = cfg.mode === 'auto';
+    shadow.getElementById('autoUpgrade').disabled = cfg.mode === 'auto';
+    shadow.getElementById('reserve').disabled = cfg.mode === 'auto';
     const wave = latest?.battle.max_wave;
     shadow.getElementById('badge').textContent = 'MK Pilot · ' + (active ? 'работает' : 'стоп') +
       (wave != null ? ' · рекорд ' + wave : '');
     shadow.getElementById('explain').textContent = cfg.mode === 'auto'
-      ? 'Фарм ×8. Каждые 3 минуты — одно улучшение и попытка волны до 90 секунд. Затем снова фарм.'
+      ? 'Прохожу волны подряд. При отказе фармлю бананы 3 минуты. Покупаю урон при наличии полной цены.'
       : cfg.mode === 'paced'
       ? 'Обычные враги погибают у центра. Босс теряет здоровье по мере движения. Зачёт подтверждает сервер.'
       : cfg.mode === 'farmer'
@@ -1063,7 +1095,7 @@
         '\nЗдоровье: ' + n(engine?.hp) + '/' + n(engine?.maxHp) +
         '\nФарм: ' + n(stats.farmCycles) + ' забегов · ' + n(summary().incomePerMinute) + '/мин' +
         (cfg.mode === 'auto' ? '\nАвтомат: ' + ({ farm: 'фарм', prepare: 'подготовка', push: 'попытка волны', retreat: 'возврат к фарму' }[automatic.stage]) +
-          ' · попытка через ' + n(summary().automation.nextAttemptSeconds) + ' с' : '')
+          (automatic.nextAttemptAt ? ' · проверка через ' + n(summary().automation.nextAttemptSeconds) + ' с' : '') : '')
       : 'Ожидаю загрузки игры…';
     const waitSeconds = Math.max(0, Math.ceil((savingUntil - Date.now()) / 1000));
     shadow.getElementById('msg').textContent = waitingForKills
@@ -1092,6 +1124,20 @@
   }
   const api = {
     version: VERSION, start, stop, exitWave, status: summary, uninstall,
+    async top(by = 'wave') {
+      if (!['wave', 'bananas'].includes(by)) throw new Error('Неизвестный вид рейтинга.');
+      if (!authorization) throw new Error('Данные входа ещё не получены.');
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await nativeFetch.call(window, '/api/top?by=' + by, {
+          method: 'GET', credentials: 'same-origin', signal: controller.signal,
+          headers: { Authorization: authorization },
+        });
+        if (!response.ok) throw new Error('Рейтинг временно недоступен.');
+        return await response.json();
+      } finally { clearTimeout(timer); }
+    },
     configure(options) {
       cfg = cleanConfig({ ...cfg, ...options }); saveConfig();
       syncControls();
