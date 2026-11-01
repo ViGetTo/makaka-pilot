@@ -1,0 +1,199 @@
+{
+  "version": "2.7.0",
+  "date": "2026-11-01",
+  "scope": "Virtual bananas; no casino bets, payments or purchases by the benchmark",
+  "profile": {
+    "wave": 64,
+    "damageLevel": 26,
+    "criticalLevel": 17
+  },
+  "bulkSearch": {
+    "version": "2.6.1",
+    "measuredAt": "2026-11-01T18:06:17.024Z",
+    "samples": [
+      {
+        "kills": 12,
+        "cycles": 2,
+        "gain": 45654,
+        "seconds": 55.706,
+        "perMinute": 49173.15908519728
+      },
+      {
+        "kills": 16,
+        "cycles": 2,
+        "gain": 60872,
+        "seconds": 78.102,
+        "perMinute": 46763.463163555345
+      },
+      {
+        "kills": 8,
+        "cycles": 2,
+        "gain": 30436,
+        "seconds": 39.603,
+        "perMinute": 46111.65820771154
+      },
+      {
+        "kills": 4,
+        "cycles": 2,
+        "gain": 15218,
+        "seconds": 23.703,
+        "perMinute": 38521.706113150234
+      },
+      {
+        "kills": 3,
+        "cycles": 2,
+        "gain": 7608,
+        "seconds": 12.015,
+        "perMinute": 37992.50936329588
+      }
+    ]
+  },
+  "shortSearch": {
+    "version": "2.6.2",
+    "measuredAt": "2026-11-01T18:11:21.572Z",
+    "results": [
+      {
+        "kills": 2,
+        "cycles": 3,
+        "gain": 7608,
+        "seconds": 12.105,
+        "perMinute": 37710.03717472119
+      },
+      {
+        "kills": 1,
+        "cycles": 3,
+        "gain": 3804,
+        "seconds": 7.217,
+        "perMinute": 31625.329084106972
+      }
+    ]
+  },
+  "remainingSearch": {
+    "version": "2.6.2",
+    "measuredAt": "2026-11-01T18:24:58.001Z",
+    "profile": {
+      "wave": 64,
+      "damageLevel": 26,
+      "criticalLevel": 17,
+      "nativeReportReady": true
+    },
+    "results": [
+      {
+        "kills": 15,
+        "cycles": 2,
+        "gain": 53262,
+        "seconds": 63.052,
+        "perMinute": 50683.879972086535
+      },
+      {
+        "kills": 10,
+        "cycles": 2,
+        "gain": 35508,
+        "seconds": 43.202,
+        "perMinute": 49314.38359335216
+      },
+      {
+        "kills": 11,
+        "cycles": 2,
+        "gain": 38044,
+        "seconds": 46.958,
+        "perMinute": 48610.247455172714
+      },
+      {
+        "kills": 9,
+        "cycles": 2,
+        "gain": 32972,
+        "seconds": 41.203,
+        "perMinute": 48013.9795645948
+      },
+      {
+        "kills": 13,
+        "cycles": 2,
+        "gain": 48190,
+        "seconds": 61.252,
+        "perMinute": 47204.989224841636
+      },
+      {
+        "kills": 14,
+        "cycles": 2,
+        "gain": 50726,
+        "seconds": 65.353,
+        "perMinute": 46571.08319434457
+      },
+      {
+        "kills": 5,
+        "cycles": 2,
+        "gain": 17754,
+        "seconds": 23.057,
+        "perMinute": 46200.28624712669
+      },
+      {
+        "kills": 7,
+        "cycles": 2,
+        "gain": 22826,
+        "seconds": 31.208,
+        "perMinute": 43884.90130735709
+      },
+      {
+        "kills": 6,
+        "cycles": 2,
+        "gain": 20290,
+        "seconds": 29.354,
+        "perMinute": 41473.05307624174
+      }
+    ]
+  },
+  "validation12": {
+    "version": "2.6.2",
+    "measuredAt": "2026-11-01T18:16:18.294Z",
+    "profile": {
+      "wave": 64,
+      "damageLevel": 26,
+      "criticalLevel": 17,
+      "nativeReportReady": true
+    },
+    "results": [
+      {
+        "kills": 12,
+        "cycles": 5,
+        "gain": 114135,
+        "seconds": 141.405,
+        "perMinute": 48428.98058767371
+      }
+    ]
+  },
+  "winnerValidation": {
+    "version": "2.7.0",
+    "measuredAt": "2026-11-01T18:31:53.342Z",
+    "profile": {
+      "wave": 64,
+      "damageLevel": 26,
+      "criticalLevel": 17,
+      "nativeReportReady": true
+    },
+    "results": [
+      {
+        "kills": 15,
+        "cycles": 5,
+        "gain": 133155,
+        "seconds": 161.555,
+        "perMinute": 49452.50843366036
+      }
+    ]
+  },
+  "rocket": {
+    "samples": 121,
+    "durationSeconds": 119.995,
+    "distinctRounds": 6,
+    "phases": [
+      "betting",
+      "flying",
+      "crashed"
+    ],
+    "prematureCrashObserved": false,
+    "prematureHistoryChangeObserved": false,
+    "betRequests": 0
+  },
+  "testsPassed": 38,
+  "phoneTested": false
+}

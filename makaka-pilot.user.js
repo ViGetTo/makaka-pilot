@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.4.3
+// @version      2.7.0
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,10 +12,10 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.4.3';
+  const VERSION = '2.7.0';
   const DEFAULTS = {
     mode: 'farmer', speed: 8, autoUpgrade: true, mine: true,
-    collect: true, reserve: 0, targetWave: 60, sessionMinutes: 60, farmTarget: 1000000, gearAuto: false,
+    collect: true, reserve: 0, targetWave: 60, sessionMinutes: 60, farmTarget: 1000000, farmKills: 0, gearAuto: false,
   };
   const MODES = new Set(['normal', 'survival', 'turbo', 'maximum', 'farmer', 'paced']);
   const isFast = mode => ['turbo', 'maximum', 'farmer', 'paced'].includes(mode);
@@ -37,6 +37,7 @@
       targetWave: Math.floor(finite(value.targetWave ?? 0, 0, 0, 1e9)),
       sessionMinutes: finite(value.sessionMinutes ?? 60, 60, 1, 1440),
       farmTarget: finite(value.farmTarget ?? 1000000, 1000000, 0, 1e15),
+      farmKills: Math.floor(finite(value.farmKills ?? 0, 0, 0, 1000)),
       gearAuto: value.gearAuto ?? false,
     };
   }
@@ -114,10 +115,20 @@
       winProbability: 13 / 64, jackpotProbability: 1 / 64, assumedUniform: true };
   }
 
-  function farmPrefix(wave, speed = 1) {
+  function farmLocalLimit(wave) {
+    if (!wave?.cats?.length) return 0;
+    let limit = Math.min(wave.cats.length - 1, Math.max(1, wave.cats.length - 2));
+    const boss = wave.cats.findIndex(cat => cat.kind === 'boss');
+    if (boss >= 0) limit = Math.min(limit, boss);
+    return Math.max(0, limit);
+  }
+  function farmPrefix(wave, speed = 1, requestedKills = 0) {
     if (!wave?.cats?.length) return { kills: 0, reward: 0, estimate: 0 };
     let reward = 0, best = { kills: 0, reward: 0, estimate: 0 };
-    for (let i = 0; i < wave.cats.length - 1; i++) {
+    // Live server state can reserve two opponents even after local kills complete.
+    const limit = farmLocalLimit(wave);
+    const target = requestedKills > 0 ? Math.min(limit, requestedKills) : 0;
+    for (let i = 0; i < limit; i++) {
       if (wave.cats[i].kind === 'boss') break;
       reward += Math.max(0, wave.cats[i].reward || 0);
       const travel = 34 / (wave.cats[i].speed || 54);
@@ -126,13 +137,14 @@
         : 0.5 + i * wave.gap + 4;
       const estimate = reward / seconds;
       if (estimate > best.estimate) best = { kills: i + 1, reward, estimate };
+      if (target && i + 1 === target) return { kills: target, reward, estimate };
     }
     return best;
   }
   const farmPlans = new WeakMap();
-  function planForFarm(wave, speed) {
+  function planForFarm(wave, speed, kills = 0) {
     if (!wave) return { kills: 0, reward: 0, estimate: 0 };
-    if (!farmPlans.has(wave)) farmPlans.set(wave, farmPrefix(wave, speed));
+    if (!farmPlans.has(wave)) farmPlans.set(wave, farmPrefix(wave, speed, kills));
     return farmPlans.get(wave);
   }
 
@@ -150,7 +162,7 @@
     replace('shoot', function (manual) {
       const cfg = config();
       if (cfg.mode === 'farmer' && this.wave) {
-        const goal = planForFarm(this.wave, cfg.speed).kills;
+        const goal = planForFarm(this.wave, cfg.speed, cfg.farmKills).kills;
         if (goal > 0 && this.killed >= goal) return;
       }
       return shoot.call(this, manual);
@@ -177,9 +189,14 @@
     });
     replace('update', function (delta) {
       const cfg = config();
+      if (cfg.mode === 'farmer' && this.wave &&
+          this.killed >= planForFarm(this.wave, cfg.speed, cfg.farmKills).kills) {
+        update.call(this, delta); // Keep animations alive without accelerating an already finished prefix.
+        return;
+      }
       const advance = (dt) => {
         update.call(this, dt);
-        if (cfg.mode === 'farmer' && this.wave && this.killed >= planForFarm(this.wave, cfg.speed).kills) return;
+        if (cfg.mode === 'farmer' && this.wave && this.killed >= planForFarm(this.wave, cfg.speed, cfg.farmKills).kills) return;
         if (this.phase !== 'running') return;
         if (!this.frontCats().some(cat => !cat.deco)) return;
         const front = this.frontCats().find(cat => !cat.deco);
@@ -213,7 +230,7 @@
   }
 
   const Core = { cleanConfig, combatChoices, chooseCombatUpgrade, energyAt, tapCount,
-    economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, WRITABLE };
+    economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, farmLocalLimit, WRITABLE };
   if (typeof module === 'object' && module.exports) {
     module.exports = Core;
     return;
@@ -258,7 +275,8 @@
   const trials = [];
   const farmCycles = [];
   let farmRetreatAt = 0;
-  let battleGeneration = 0, pendingFail = false;
+  let battleGeneration = 0, pendingFail = false, externallyStale = false;
+  let reportKills = null, earlyReportedWave = null, lastStepAt = 0;
   const parked = () => new Promise(() => {});
   const staleReply = () => new Response(JSON.stringify({ error: 'stale_wave', message: 'Забег уже отменён.' }),
     { status: 409, headers: { 'Content-Type': 'application/json' } });
@@ -283,7 +301,7 @@
     const canvases = document.querySelectorAll('main canvas');
     for (const canvas of canvases) {
       const key = Object.keys(canvas).find(k => k.startsWith('__reactFiber$'));
-      let f = key && canvas[key], found = null, context = null;
+      let f = key && canvas[key], found = null, context = null, report = null;
       for (let depth = 0; f && depth < 30; depth++, f = f.return) {
         for (const node of [f, f.alternate]) {
           if (!node) continue;
@@ -292,13 +310,15 @@
             const value = hook.memoizedState?.current;
             if (value?.canvas === canvas && typeof value.update === 'function' &&
                 typeof value.tap === 'function' && typeof value.hurtMonkey === 'function') found = value;
+            const callback = hook.memoizedState?.[0];
+            if (typeof callback === 'function' && Function.prototype.toString.call(callback).includes('.battleKills(')) report = callback;
           }
           const value = node.memoizedProps?.value;
           if (value?.state?.stats && typeof value.setState === 'function' &&
               (!context || value.state.now >= context.state.now)) context = value;
         }
       }
-      if (found && context) return { engine: found, context };
+      if (found && context) return { engine: found, context, report };
     }
     return null;
   }
@@ -316,6 +336,7 @@
     const next = findBridge();
     if (!next) return false;
     bridge = next.context;
+    reportKills = next.report;
     receive(bridge.state);
     if (engine !== next.engine) {
       restore?.(); restore = null;
@@ -337,6 +358,9 @@
   const observedFetch = function (input, init) {
     if (!installed) return nativeFetch.apply(this, arguments);
     const path = apiPath(input);
+    if (externallyStale && ['/api/battle/kills', '/api/battle/clear'].includes(path)) {
+      return Promise.resolve(staleReply());
+    }
     const invokedAt = Date.now();
     const isBattle = path?.startsWith('/api/battle/');
     if (path === '/api/battle/start' || path === '/api/battle/fail') {
@@ -453,7 +477,7 @@
     });
     if (path === '/api/battle/fail') ownedPromise.catch(() => { pendingFail = false; });
     if (path) ownedPromise.then(response => {
-      if (!installed) return;
+      if (!installed || (isBattle && generation !== battleGeneration)) return;
       const cacheCopy = path === '/api/battle/kills' ? response.clone() : null;
       if (response.status === 401 || response.status === 403) {
         if (active) stop('Сессия истекла. Заново открой игру через Telegram.');
@@ -462,6 +486,7 @@
         if (!installed) return;
         if (data.state) receive(data.state);
         if (path === '/api/battle/start' && response.ok && data.wave) {
+          externallyStale = false;
           waveClock = { wave: data.wave, startedAt: Date.now(), accelerated: isFast(cfg.mode) };
           acceptedWave = data.wave.wave; acceptedKills = 0;
           lastKillReply = null;
@@ -486,6 +511,10 @@
           lastBattleError = { path, status: response.status, code: String(data.error || ''),
             message: String(data.message || ''), at: new Date().toISOString() };
           if (response.status === 429) stop('Сервер ограничил частоту запросов. Автоматизация остановлена.');
+          else if (data.error === 'stale_wave') {
+            externallyStale = true;
+            stop('Сервер сбросил бой. Останови другие запуски этого аккаунта и перезагрузи игру.');
+          }
           else if (data.error === 'too_fast') {
             // Increase waiting time before the game's own retry. No forged result or time is sent.
             timingPenalty += 15000;
@@ -575,6 +604,7 @@
     render();
   }
   function start(options = {}) {
+    if (externallyStale) { note('После сброса сервером нужна перезагрузка игры.'); render(); return false; }
     cfg = cleanConfig({ ...cfg, ...options }); saveConfig(); syncControls();
     visibleButton(text => text === 'Игра')?.click();
     if (!refreshBridge()) {
@@ -607,6 +637,7 @@
       return;
     }
     if (hiddenPause) { hiddenPause = false; progressAt = now; }
+    if (cfg.mode === 'farmer') maintainFarmIncome(now);
     const front = engine.cats?.find(c => c.state !== 'dying' && !c.deco);
     const mark = [engine.wave?.wave, engine.phase, engine.killed, front?.hp, stats.best].join(':');
     if (mark !== progressMark) { progressMark = mark; progressAt = now; }
@@ -637,18 +668,23 @@
       note('Цель накопления достигнута. Покупаю улучшения и прохожу волны.');
     }
     if (cfg.mode === 'farmer' && engine.phase === 'running') {
-      const plan = planForFarm(engine.wave, cfg.speed);
+      const plan = planForFarm(engine.wave, cfg.speed, cfg.farmKills);
       if (plan.kills > 0 && engine.killed >= plan.kills) {
         if (acceptedWave !== engine.wave.wave || acceptedKills < plan.kills) {
+          if (reportKills && earlyReportedWave !== engine.wave) {
+            earlyReportedWave = engine.wave;
+            Promise.resolve().then(() => reportKills()).catch(() => {});
+          }
           message = 'Фарм: сервер подтвердил ' + acceptedKills + '/' + plan.kills + ' убийств.';
           return;
         }
         const exit = visibleButton(text => text === 'ВЫЙТИ ИЗ ВОЛНЫ');
-        if (exit && now - farmRetreatAt > 1500) {
-          farmRetreatAt = now; actionAt = now + 1600;
+        if (exit && !pendingFail && now - farmRetreatAt > 250) {
+          farmRetreatAt = now; actionAt = now + 100;
           stats.farmCycles++;
           farmCycles.push({ at: new Date().toISOString(), wave: engine.wave.wave,
-            kills: plan.kills, reward: plan.reward,
+            kills: acceptedKills, targetKills: plan.kills,
+            reward: engine.wave.cats.slice(0, acceptedKills).reduce((sum, cat) => sum + cat.reward, 0),
             seconds: trial ? Math.round((now - trial.startedAt) / 100) / 10 : null,
             bananas: latest.bananas });
           if (farmCycles.length > 100) farmCycles.shift();
@@ -669,7 +705,7 @@
         note(resume ? 'Бой продолжен.' : 'Начинаю следующую волну.');
       }
     }
-    if (busy || now < nextRequest || !authorization) return;
+    if (cfg.mode === 'farmer' || busy || now < nextRequest || !authorization) return;
     if (needsSync) {
       const result = await request('/api/state');
       if (result) needsSync = false;
@@ -716,6 +752,27 @@
     }
   }
 
+  function maintainFarmIncome(now) {
+    if (busy || now < nextRequest || !authorization || !latest) return;
+    if (needsSync) {
+      request('/api/state').then(result => { if (result) needsSync = false; });
+      return;
+    }
+    const serverNow = now / 1000 + stateSkew;
+    const pending = Math.min(latest.stats.gen * latest.stats.storage_hours,
+      latest.stats.gen * Math.max(0, serverNow - latest.mine.since) / 3600);
+    if (cfg.collect && pending >= 1 && now >= collectAt) {
+      collectAt = now + 30000;
+      request('/api/mine/collect').then(result => { if (result) note('Собран доход генератора.'); });
+    } else if (cfg.mine && latest.stats.autoclick > 0 && latest.features?.autoclick !== false && now >= autoAt) {
+      autoAt = now + 5000;
+      request('/api/mine/auto');
+    } else if (cfg.mine) {
+      const taps = tapCount(latest, serverNow);
+      if (taps > 0) request('/api/mine/tap', { taps });
+    }
+  }
+
   function summary() {
     stats.gained = latest && baselineBalance !== null ? latest.bananas - baselineBalance + stats.spent : 0;
     return {
@@ -729,6 +786,7 @@
       saveWaitSeconds: Math.max(0, Math.ceil((savingUntil - Date.now()) / 1000)),
       lastBattleError,
       serverKills: { wave: acceptedWave, counted: acceptedKills, waiting: waitingForKills },
+      farmReportReady: !!reportKills,
       currentTrial: trial ? JSON.parse(JSON.stringify(trial)) : null,
       trials: JSON.parse(JSON.stringify(trials)),
       farmCycles: JSON.parse(JSON.stringify(farmCycles)),
@@ -866,7 +924,14 @@
   };
   window.MakakaPilot = api;
   document.addEventListener('keydown', onKey);
-  loopTimer = setInterval(() => { buildPanel(); if (active) step().catch(e => stop('Ошибка контроллера: ' + e.message)); }, 250);
+  loopTimer = setInterval(() => {
+    buildPanel();
+    const now = Date.now();
+    if (active && now - lastStepAt >= (cfg.mode === 'farmer' ? 100 : 250)) {
+      lastStepAt = now;
+      step().catch(e => stop('Ошибка контроллера: ' + e.message));
+    }
+  }, 100);
   renderTimer = setInterval(() => { if (!active) refreshBridge(); render(); }, 1000);
   buildPanel(); refreshBridge();
 })();

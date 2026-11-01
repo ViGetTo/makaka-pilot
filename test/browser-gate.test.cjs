@@ -4,6 +4,43 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 
+test('a genuine stale wave stops the farmer and suppresses repeated network reports', async () => {
+  let reports = 0;
+  const canvas = {};
+  const engine = { canvas, phase: 'idle', running: false, hp: 100, maxHp: 100,
+    update() {}, hurtMonkey() {}, damage() {}, tap() {}, shoot() {}, frontCats() { return []; }, stop() {} };
+  canvas.__reactFiber$test = { memoizedState: { memoizedState: { current: engine }, next: null },
+    memoizedProps: { value: { state: { now: 1, bananas: 0, stats: {}, battle: { wave: 55, max_wave: 54 } }, setState() {} } } };
+  const context = {
+    URL, URLSearchParams, Headers, Request, Response, AbortController, Date, Math, JSON, Number, Set, Map, Object, Error, Blob,
+    setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {},
+    location: { origin: 'https://makaka.wivvi.net', href: 'https://makaka.wivvi.net/', hash: '' },
+    localStorage: { getItem: () => null, setItem() {} },
+    document: { body: null, querySelectorAll: s => s === 'main canvas' ? [canvas] : [], addEventListener() {}, removeEventListener() {} },
+    async fetch(input) {
+      const path = new URL(input, 'https://makaka.wivvi.net').pathname;
+      if (path.endsWith('/start')) return new Response(JSON.stringify({ wave: { wave: 55, gap: 1.6, cats: [{ hp: 10 }, { hp: 10 }] } }));
+      reports++;
+      return new Response(JSON.stringify({ error: 'stale_wave' }), { status: 409 });
+    },
+  };
+  context.window = context;
+  vm.runInNewContext(fs.readFileSync('makaka-pilot.user.js', 'utf8'), context);
+  context.MakakaPilot.start({ mode: 'farmer', mine: false });
+  await context.fetch('/api/battle/start', { method: 'POST', body: '{}' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  await context.fetch('/api/battle/kills', { method: 'POST', body: '{"wave":55,"kills":1}' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(context.MakakaPilot.status().active, false);
+  assert.equal(context.MakakaPilot.status().serverKills.counted, 0);
+  for (let i = 0; i < 3; i++) {
+    const response = await context.fetch('/api/battle/kills', { method: 'POST', body: '{"wave":55,"kills":1}' });
+    assert.equal(response.status, 409);
+  }
+  assert.equal(reports, 1);
+  assert.equal(context.MakakaPilot.start(), false);
+});
+
 test('game launch strips the automation marker while preserving auth, request data and other origins', async () => {
   const sent = [];
   const nativeFetch = async (input, init) => {

@@ -23,18 +23,19 @@ mkdir -p node_modules
 NPM
 chmod +x "$test_dir/stubs/"*
 export PATH="$test_dir/stubs:$PATH" MAKAKA_REPO_DIR="$test_dir/client"
-bash "$root/makaka.sh" > "$test_dir/first"
+bash "$test_dir/client/makaka.sh" > "$test_dir/first"
 grep -q v1 "$test_dir/first"
 printf 'v2\n' > "$test_dir/upstream/version"
+{ head -n 1 "$root/makaka.sh"; printf '# Changed launcher header while it is running\n%.0s' {1..100}; tail -n +2 "$root/makaka.sh"; } > "$test_dir/upstream/makaka.sh"
 git -C "$test_dir/upstream" commit -qam update
-bash "$root/makaka.sh" > "$test_dir/second"
+bash "$test_dir/client/makaka.sh" > "$test_dir/second"
 grep -q v2 "$test_dir/second"
 printf 'local-edit\n' > "$test_dir/client/version"
-if bash "$root/makaka.sh" > /dev/null 2>&1; then echo 'FAIL: overwritten dirty checkout'; exit 1; fi
+if bash "$test_dir/client/makaka.sh" > /dev/null 2>&1; then echo 'FAIL: overwritten dirty checkout'; exit 1; fi
 grep -q local-edit "$test_dir/client/version"
 git -C "$test_dir/client" restore version
 git -C "$test_dir/client" remote set-url origin "$test_dir/no-such-repository"
-if bash "$root/makaka.sh" > /dev/null 2>&1; then echo 'FAIL: update failure was hidden'; exit 1; fi
-bash "$root/makaka.sh" --offline > "$test_dir/offline"
+if bash "$test_dir/client/makaka.sh" > /dev/null 2>&1; then echo 'FAIL: update failure was hidden'; exit 1; fi
+bash "$test_dir/client/makaka.sh" --offline > "$test_dir/offline"
 grep -q v2 "$test_dir/offline"
 echo 'PASS: update, local edits, network failure and explicit offline mode'

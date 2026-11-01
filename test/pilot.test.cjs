@@ -142,7 +142,9 @@ test('farmer picks the high-yield prefix before the boss', () => {
   const p = C.farmPrefix({ cats, gap: 1.6 });
   assert.equal(p.kills, 16); assert.equal(p.reward, 20132);
   const fast = C.farmPrefix({ cats, gap: 1.6 }, 8);
-  assert.equal(fast.kills, 17); assert.equal(fast.reward, 20971);
+  assert.equal(fast.kills, 16); assert.equal(fast.reward, 20132);
+  assert.equal(C.farmPrefix({ cats, gap: 1.6 }, 8, 4).kills, 4);
+  assert.equal(C.farmPrefix({ cats, gap: 1.6 }, 8, 999).kills, 16);
 });
 test('farmer stops shooting at its target while world animations continue', () => {
   const e = new Engine();
@@ -151,8 +153,22 @@ test('farmer stops shooting at its target while world animations continue', () =
   const off = C.patchEngine(e, () => ({ mode: 'farmer', speed: 8 }), counts());
   e.update(.05);
   assert.ok(e.elapsed > 0); assert.equal(e.phase, 'running'); assert.equal(e.shots, 0);
+  assert.equal(e.elapsed, .05, 'a completed prefix should animate once at normal speed');
   const hp = e.cat.hp; e.shoot(true);
   assert.equal(e.cat.hp, hp, 'manual taps cannot kill the remaining opponents after the farming target');
+  off();
+});
+
+test('a requested farming prefix stops local kills before the larger safety limit', () => {
+  const e = new Engine();
+  e.wave = { cats: Array.from({ length: 18 }, () => ({ kind: 'cat', reward: 10 })), gap: 1.6 };
+  e.killed = 4;
+  const off = C.patchEngine(e, () => ({ mode: 'farmer', speed: 8, farmKills: 4 }), counts());
+  e.update(.05);
+  assert.equal(e.shots, 0, 'a chosen short prefix must not kill extra opponents');
+  assert.equal(C.farmLocalLimit(e.wave), 16);
+  e.killed = 16;
+  const shots = e.shots; e.shoot(true); assert.equal(e.shots, shots);
   off();
 });
 test('paced battle waits for ordinary enemies to reach center and drains boss HP across its path', () => {

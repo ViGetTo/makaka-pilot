@@ -8,7 +8,8 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ORIGIN, DEFAULT_OPTIONS, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
+import { ORIGIN, DEFAULT_OPTIONS, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
+import { tuneFarm } from './lib/tuning.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const stateDir = resolve(process.env.MAKAKA_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'makaka-pilot'));
@@ -41,7 +42,7 @@ async function configure() {
   if (!['farmer', 'paced'].includes(mode)) throw new Error('Укажи farmer или paced.');
   opts.mode = mode;
   for (const [key, label, max] of [ ['farmTarget', 'Копить до (0 — без конца)', 1e15],
-    ['targetWave', 'Целевая волна (0 — без цели)', 1e9], ['sessionMinutes', 'Длительность, минут', 1440] ]) {
+    ['targetWave', 'Целевая волна (0 — без цели)', 1e9], ['farmKills', 'Пачка убийств (0 — авто)', 1000], ['sessionMinutes', 'Длительность, минут', 1440] ]) {
     const n = Number(await question(`${label} [${opts[key]}]: `, String(opts[key])));
     if (!Number.isFinite(n) || n < (key === 'sessionMinutes' ? 1 : 0) || n > max) throw new Error('Недопустимое число. Настройки не изменены.');
     opts[key] = Math.floor(n);
@@ -87,9 +88,10 @@ async function acquire() {
   }
 }
 
-async function run(checkOnly = false) {
+async function run(checkOnly = false, tuning = false) {
   let config = await readJson(configPath);
   if (!config?.url) { await login(); config = await readJson(configPath); }
+  if (command === 'farm') config = { ...config, options: farmSessionOptions(config.options) };
   const url = validateLaunchUrl(config.url), executablePath = await browserPath();
   await acquire();
   let browser, page, stopping = false, last = null, terminalError = false;
@@ -127,6 +129,17 @@ async function run(checkOnly = false) {
     }
     try { await page.waitForFunction(() => !!window.MakakaPilot?.status()?.battle, { timeout: 15000 }); }
     catch { throw new Error('Вход выполнен, но движок игры не обнаружен. Возможно, игра обновилась; фарм не запускался.'); }
+    if (tuning && !stopping) {
+      const ranked = await tuneFarm(page, { stopped: () => stopping,
+        readStop: async () => !!await readJson(stopPath, false) });
+      if (!ranked?.length) { console.log('Подбор остановлен. Настройки не изменены.'); return; }
+      await privateJson(join(stateDir, 'tuning.json'), { measuredAt: new Date().toISOString(), samples: ranked });
+      const fresh = await readJson(configPath, config);
+      await privateJson(configPath, { ...fresh, options: { ...DEFAULT_OPTIONS, ...fresh.options,
+        mode: 'farmer', speed: 8, farmKills: ranked[0].kills } });
+      console.log(`Выбрано ${ranked[0].kills} убийств: ${Math.round(ranked[0].perMinute)} бананов/мин в коротком замере. Запуск: makaka`);
+      return;
+    }
     if (!checkOnly && !stopping) {
       const ok = await page.evaluate(options => window.MakakaPilot.start(options), { ...DEFAULT_OPTIONS, ...config.options });
       if (!ok) throw new Error('Движок игры не обнаружен. Фарм не запущен.');
@@ -169,7 +182,8 @@ try {
     if (!await readJson(lockPath)) console.log('Скрипт не запущен.');
     else { await privateJson(stopPath, { requestedAt: new Date().toISOString() }); console.log('Запрос остановки отправлен.'); }
   } else if (command === 'check') await run(true);
-  else if (command === 'start') await run();
+  else if (command === 'tune') await run(false, true);
+  else if (command === 'start' || command === 'farm') await run();
   else if (command === 'doctor') console.log(`Node ${process.version}; Chromium: ${await browserPath()}; настройки: ${stateDir}`);
-  else throw new Error('Команды: makaka [start|login|config|check|status|stop|doctor]');
+  else throw new Error('Команды: makaka [start|farm|login|config|tune|check|status|stop|doctor]');
 } catch (e) { console.error(redact(e.message)); process.exitCode = 1; }

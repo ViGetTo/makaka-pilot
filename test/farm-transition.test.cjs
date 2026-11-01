@@ -38,7 +38,7 @@ test('bank mode makes no purchases before one million, then switches to progress
   };
   context.window = context;
   vm.runInNewContext(fs.readFileSync('makaka-pilot.user.js', 'utf8'), context);
-  const pause = () => new Promise(resolve => setTimeout(resolve, 25));
+  const pause = () => new Promise(resolve => setTimeout(resolve, 130));
   context.MakakaPilot.start({ mode: 'farmer', farmTarget: 1000000, mine: false, collect: false, autoUpgrade: true });
   intervals[0](); await pause();
   assert.equal(context.MakakaPilot.status().config.mode, 'farmer');

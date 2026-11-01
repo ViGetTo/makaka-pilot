@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, stat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ORIGIN, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from '../lib/core.mjs';
+import { ORIGIN, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from '../lib/core.mjs';
 
 const example = ORIGIN + '/#tgWebAppData=' + encodeURIComponent(new URLSearchParams({
   user: '{"id":1}', auth_date: '1', hash: 'test-only-not-a-real-signature' }).toString());
@@ -11,6 +11,16 @@ const example = ORIGIN + '/#tgWebAppData=' + encodeURIComponent(new URLSearchPar
 test('normalizes the headless label without inventing a browser version or platform', () => {
   assert.equal(normalUserAgent('Linux aarch64 HeadlessChrome/156.0.1 Safari/537.36'), 'Linux aarch64 Chrome/156.0.1 Safari/537.36');
   assert.equal(normalUserAgent('normal browser'), 'normal browser');
+});
+
+test('continuous farm session preserves the chosen prefix and duration while disabling spending and bank targets', () => {
+  const saved = { mode: 'paced', autoUpgrade: true, gearAuto: true, farmTarget: 1000000, targetWave: 60, farmKills: 15, sessionMinutes: 20 };
+  const run = farmSessionOptions(saved);
+  assert.equal(run.mode, 'farmer'); assert.equal(run.speed, 8);
+  assert.equal(run.autoUpgrade, false); assert.equal(run.gearAuto, false);
+  assert.equal(run.farmTarget, 0); assert.equal(run.targetWave, 0);
+  assert.equal(run.farmKills, 15); assert.equal(run.sessionMinutes, 20);
+  assert.equal(saved.autoUpgrade, true); assert.equal(saved.farmTarget, 1000000);
 });
 
 test('accepts a full launch link without pretending to validate its signature', () => {
