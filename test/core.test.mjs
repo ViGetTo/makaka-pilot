@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, stat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ORIGIN, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from '../lib/core.mjs';
+import { ORIGIN, automaticSessionOptions, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from '../lib/core.mjs';
 
 const example = ORIGIN + '/#tgWebAppData=' + encodeURIComponent(new URLSearchParams({
   user: '{"id":1}', auth_date: '1', hash: 'test-only-not-a-real-signature' }).toString());
@@ -21,6 +21,19 @@ test('continuous farm session preserves the chosen prefix and duration while dis
   assert.equal(run.farmTarget, 0); assert.equal(run.targetWave, 0);
   assert.equal(run.farmKills, 15); assert.equal(run.sessionMinutes, 20);
   assert.equal(saved.autoUpgrade, true); assert.equal(saved.farmTarget, 1000000);
+});
+
+test('normal launch migrates the old bank plan to unlimited automatic farming and periodic attempts', () => {
+  const old = { mode: 'paced', autoUpgrade: false, gearAuto: true, targetWave: 60,
+    farmTarget: 1000000, farmKills: 15, sessionMinutes: 60, reserve: 123 };
+  const options = automaticSessionOptions(old);
+  assert.equal(options.mode, 'auto'); assert.equal(options.speed, 8);
+  assert.equal(options.sessionMinutes, 0); assert.equal(options.autoUpgrade, true);
+  assert.equal(options.targetWave, 0); assert.equal(options.farmTarget, 0);
+  assert.equal(options.gearAuto, false); assert.equal(options.farmKills, 15);
+  assert.equal(options.reserve, 123); assert.equal(old.mode, 'paced');
+  const configured = automaticSessionOptions({ ...options, sessionMinutes: 20, autoUpgrade: false });
+  assert.equal(configured.sessionMinutes, 20); assert.equal(configured.autoUpgrade, false);
 });
 
 test('accepts a full launch link without pretending to validate its signature', () => {

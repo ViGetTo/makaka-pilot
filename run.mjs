@@ -8,8 +8,9 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ORIGIN, DEFAULT_OPTIONS, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
+import { ORIGIN, DEFAULT_OPTIONS, automaticSessionOptions, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
 import { tuneFarm } from './lib/tuning.mjs';
+import { probeFastRestart } from './lib/probe.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const stateDir = resolve(process.env.MAKAKA_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'makaka-pilot'));
@@ -37,18 +38,15 @@ async function login() {
 }
 
 async function configure() {
-  const previous = await readJson(configPath, {}), opts = { ...DEFAULT_OPTIONS, ...previous.options };
-  const mode = await question(`Режим farmer/paced [${opts.mode}]: `, opts.mode);
-  if (!['farmer', 'paced'].includes(mode)) throw new Error('Укажи farmer или paced.');
-  opts.mode = mode;
-  for (const [key, label, max] of [ ['farmTarget', 'Копить до (0 — без конца)', 1e15],
-    ['targetWave', 'Целевая волна (0 — без цели)', 1e9], ['farmKills', 'Пачка убийств (0 — авто)', 1000], ['sessionMinutes', 'Длительность, минут', 1440] ]) {
+  const previous = await readJson(configPath, {}), opts = automaticSessionOptions(previous.options);
+  console.log('Автомат: фарм и попытка волны каждые 3 минуты. makaka farm — только фарм.');
+  for (const [key, label, max] of [ ['reserve', 'Резерв бананов', 1e15],
+    ['farmKills', 'Пачка убийств (0 — авто)', 1000], ['sessionMinutes', 'Длительность, минут (0 — без конца)', 1440] ]) {
     const n = Number(await question(`${label} [${opts[key]}]: `, String(opts[key])));
-    if (!Number.isFinite(n) || n < (key === 'sessionMinutes' ? 1 : 0) || n > max) throw new Error('Недопустимое число. Настройки не изменены.');
+    if (!Number.isFinite(n) || n < 0 || n > max) throw new Error('Недопустимое число. Настройки не изменены.');
     opts[key] = Math.floor(n);
   }
-  opts.speed = mode === 'farmer' ? 8 : 1;
-  opts.autoUpgrade = (await question('Покупать улучшения при прохождении? y/N: ', 'n')).toLowerCase() === 'y';
+  opts.autoUpgrade = (await question('Покупать одно боевое улучшение перед попыткой? Y/n: ', opts.autoUpgrade ? 'y' : 'n')).toLowerCase() === 'y';
   opts.gearAuto = false;
   await privateJson(configPath, { ...previous, options: opts });
   console.log('Настройки сохранены. Запуск: makaka');
@@ -88,10 +86,11 @@ async function acquire() {
   }
 }
 
-async function run(checkOnly = false, tuning = false) {
+async function run(checkOnly = false, tuning = false, probing = false) {
   let config = await readJson(configPath);
   if (!config?.url) { await login(); config = await readJson(configPath); }
   if (command === 'farm') config = { ...config, options: farmSessionOptions(config.options) };
+  else if (!checkOnly && !tuning && !probing) config = { ...config, options: automaticSessionOptions(config.options) };
   const url = validateLaunchUrl(config.url), executablePath = await browserPath();
   await acquire();
   let browser, page, stopping = false, last = null, terminalError = false;
@@ -136,8 +135,18 @@ async function run(checkOnly = false, tuning = false) {
       await privateJson(join(stateDir, 'tuning.json'), { measuredAt: new Date().toISOString(), samples: ranked });
       const fresh = await readJson(configPath, config);
       await privateJson(configPath, { ...fresh, options: { ...DEFAULT_OPTIONS, ...fresh.options,
-        mode: 'farmer', speed: 8, farmKills: ranked[0].kills } });
+        farmKills: ranked[0].kills } });
       console.log(`Выбрано ${ranked[0].kills} убийств: ${Math.round(ranked[0].perMinute)} бананов/мин в коротком замере. Запуск: makaka`);
+      return;
+    }
+    if (probing && !stopping) {
+      console.log('Проверяю быстрые убийства и выход через паузу. Покупки, кликер и сбор выключены.');
+      const result = await probeFastRestart(page, { stopped: () => stopping,
+        readStop: async () => !!await readJson(stopPath, false) });
+      await privateJson(join(stateDir, 'probe.json'), result);
+      console.log(result.message);
+      console.log(`Баланс до: ${result.before?.bananas ?? '?'}; после выхода: ${result.afterExit?.bananas ?? '?'}; после перезапуска: ${result.afterRestart?.bananas ?? '?'}.`);
+      console.log(`Отчёт: ${join(stateDir, 'probe.json')}`);
       return;
     }
     if (!checkOnly && !stopping) {
@@ -151,7 +160,7 @@ async function run(checkOnly = false, tuning = false) {
       last = safeStatus(await page.evaluate(() => window.MakakaPilot.status()));
       await privateJson(statusPath, last);
       if (tick++ % 5 === 0 || !last.active || checkOnly) console.log(
-        `Бананы: ${last.server?.bananas ?? '?'} | рекорд: ${last.server?.bestWave ?? '?'} | бой: ${last.battle?.wave ?? '-'} ${last.battle?.killed ?? 0}/${last.battle?.total ?? '-'} | ${last.incomePerMinute ?? 0}/мин | ${last.message || ''}`);
+        `Бананы: ${last.server?.bananas ?? '?'} | рекорд: ${last.server?.bestWave ?? '?'} | бой: ${last.battle?.wave ?? '-'} ${last.battle?.killed ?? 0}/${last.battle?.total ?? '-'} | ${last.incomePerMinute ?? 0}/мин | ${last.automation ? 'Автомат: ' + ({ farm: 'фарм', prepare: 'подготовка', push: 'попытка волны', retreat: 'возврат к фарму' }[last.automation.stage] || last.automation.stage) + ', до попытки ' + last.automation.nextAttemptSeconds + ' с. ' : ''}${last.message || ''}`);
       if (checkOnly || stopping || !last.active || terminalError) break;
       if (await readJson(stopPath, false)) { stopping = true; break; }
       await delay(1000);
@@ -183,7 +192,8 @@ try {
     else { await privateJson(stopPath, { requestedAt: new Date().toISOString() }); console.log('Запрос остановки отправлен.'); }
   } else if (command === 'check') await run(true);
   else if (command === 'tune') await run(false, true);
+  else if (command === 'probe') await run(false, false, true);
   else if (command === 'start' || command === 'farm') await run();
   else if (command === 'doctor') console.log(`Node ${process.version}; Chromium: ${await browserPath()}; настройки: ${stateDir}`);
-  else throw new Error('Команды: makaka [start|farm|login|config|tune|check|status|stop|doctor]');
+  else throw new Error('Команды: makaka [start|farm|login|config|tune|probe|check|status|stop|doctor]');
 } catch (e) { console.error(redact(e.message)); process.exitCode = 1; }

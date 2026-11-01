@@ -45,8 +45,8 @@ test('tap batches respect actual energy, regeneration and 60-tap limit', () => {
 });
 test('configuration bounds speed, duration and target', () => {
   const c = C.cleanConfig({ speed: 1e9, mode: 'admin', sessionMinutes: -10, targetWave: -1 });
-  assert.equal(c.speed, 8); assert.equal(c.mode, 'farmer');
-  assert.equal(c.sessionMinutes, 1); assert.equal(c.targetWave, 0);
+  assert.equal(c.speed, 8); assert.equal(c.mode, 'auto');
+  assert.equal(c.sessionMinutes, 0); assert.equal(c.targetWave, 0);
 });
 test('economy only invests in upgrades with short payback', () => {
   assert.equal(C.economyChoice(state()).kind, 'tap');

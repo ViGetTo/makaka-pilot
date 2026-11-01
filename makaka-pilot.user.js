@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.7.0
+// @version      2.8.0
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,12 +12,13 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.7.0';
+  const VERSION = '2.8.0';
+  const AUTO_INTERVAL = 180000, AUTO_TIMEOUT = 90000;
   const DEFAULTS = {
-    mode: 'farmer', speed: 8, autoUpgrade: true, mine: true,
-    collect: true, reserve: 0, targetWave: 60, sessionMinutes: 60, farmTarget: 1000000, farmKills: 0, gearAuto: false,
+    mode: 'auto', speed: 8, autoUpgrade: true, mine: true,
+    collect: true, reserve: 0, targetWave: 0, sessionMinutes: 0, farmTarget: 0, farmKills: 0, gearAuto: false,
   };
-  const MODES = new Set(['normal', 'survival', 'turbo', 'maximum', 'farmer', 'paced']);
+  const MODES = new Set(['auto', 'normal', 'survival', 'turbo', 'maximum', 'farmer', 'paced']);
   const isFast = mode => ['turbo', 'maximum', 'farmer', 'paced'].includes(mode);
   const WRITABLE = new Set([
     '/api/state', '/api/upgrade', '/api/mine/tap',
@@ -35,10 +36,10 @@
       collect: value.collect ?? DEFAULTS.collect,
       reserve: finite(value.reserve ?? 0, 0, 0, 1e15),
       targetWave: Math.floor(finite(value.targetWave ?? 0, 0, 0, 1e9)),
-      sessionMinutes: finite(value.sessionMinutes ?? 60, 60, 1, 1440),
-      farmTarget: finite(value.farmTarget ?? 1000000, 1000000, 0, 1e15),
+      sessionMinutes: finite(value.sessionMinutes ?? 0, 0, 0, 1440),
+      farmTarget: finite(value.farmTarget ?? 0, 0, 0, 1e15),
       farmKills: Math.floor(finite(value.farmKills ?? 0, 0, 0, 1000)),
-      gearAuto: value.gearAuto ?? false,
+      gearAuto: value.mode === 'auto' ? false : (value.gearAuto ?? false),
     };
   }
 
@@ -144,8 +145,9 @@
   const farmPlans = new WeakMap();
   function planForFarm(wave, speed, kills = 0) {
     if (!wave) return { kills: 0, reward: 0, estimate: 0 };
-    if (!farmPlans.has(wave)) farmPlans.set(wave, farmPrefix(wave, speed, kills));
-    return farmPlans.get(wave);
+    const key = speed + ':' + kills;
+    if (farmPlans.get(wave)?.key !== key) farmPlans.set(wave, { key, plan: farmPrefix(wave, speed, kills) });
+    return farmPlans.get(wave).plan;
   }
 
   function patchEngine(engine, config, counters) {
@@ -161,6 +163,7 @@
     const shoot = engine.shoot;
     replace('shoot', function (manual) {
       const cfg = config();
+      if (cfg.retreating) return;
       if (cfg.mode === 'farmer' && this.wave) {
         const goal = planForFarm(this.wave, cfg.speed, cfg.farmKills).kills;
         if (goal > 0 && this.killed >= goal) return;
@@ -189,6 +192,7 @@
     });
     replace('update', function (delta) {
       const cfg = config();
+      if (cfg.retreating) return;
       if (cfg.mode === 'farmer' && this.wave &&
           this.killed >= planForFarm(this.wave, cfg.speed, cfg.farmKills).kills) {
         update.call(this, delta); // Keep animations alive without accelerating an already finished prefix.
@@ -277,6 +281,33 @@
   let farmRetreatAt = 0;
   let battleGeneration = 0, pendingFail = false, externallyStale = false;
   let reportKills = null, earlyReportedWave = null, lastStepAt = 0;
+  let farmConfirmStartedAt = 0;
+  let nativeExit = null, exiting = false, stepping = false, clearInFlight = 0;
+  let runtimeFarmKills = 0;
+  const battleWaiters = new Set();
+  const automatic = { stage: 'farm', nextAttemptAt: 0, deadlineAt: 0,
+    attempts: 0, wave: null, rejection: null, retreatAt: 0, exitRequested: false, history: [] };
+  function combatConfig() {
+    if (cfg.mode !== 'auto') return cfg;
+    const push = automatic.stage === 'push';
+    return { ...cfg, mode: push ? 'paced' : 'farmer', speed: push ? 1 : 8,
+      farmKills: runtimeFarmKills || cfg.farmKills, retreating: automatic.stage === 'retreat' };
+  }
+  function cancelBattle() {
+    battleGeneration++;
+    waitingForKills = false; acceptedKills = 0; acceptedWave = null; lastKillReply = null;
+    savingUntil = 0;
+    for (const cancel of battleWaiters) cancel();
+    battleWaiters.clear();
+  }
+  function waitForBattle(ms, generation) {
+    return new Promise(resolve => {
+      if (generation !== battleGeneration) { resolve(); return; }
+      const finish = () => { clearTimeout(timer); battleWaiters.delete(finish); resolve(); };
+      const timer = setTimeout(finish, Math.max(0, ms));
+      battleWaiters.add(finish);
+    });
+  }
   const parked = () => new Promise(() => {});
   const staleReply = () => new Response(JSON.stringify({ error: 'stale_wave', message: 'Забег уже отменён.' }),
     { status: 409, headers: { 'Content-Type': 'application/json' } });
@@ -301,7 +332,7 @@
     const canvases = document.querySelectorAll('main canvas');
     for (const canvas of canvases) {
       const key = Object.keys(canvas).find(k => k.startsWith('__reactFiber$'));
-      let f = key && canvas[key], found = null, context = null, report = null;
+      let f = key && canvas[key], found = null, context = null, report = null, exit = null;
       for (let depth = 0; f && depth < 30; depth++, f = f.return) {
         for (const node of [f, f.alternate]) {
           if (!node) continue;
@@ -311,14 +342,18 @@
             if (value?.canvas === canvas && typeof value.update === 'function' &&
                 typeof value.tap === 'function' && typeof value.hurtMonkey === 'function') found = value;
             const callback = hook.memoizedState?.[0];
-            if (typeof callback === 'function' && Function.prototype.toString.call(callback).includes('.battleKills(')) report = callback;
+            if (typeof callback === 'function') {
+              const source = Function.prototype.toString.call(callback);
+              if (source.includes('.battleKills(')) report = callback;
+              if (source.includes('.battleFail(') && source.includes('.showIdle(')) exit = callback;
+            }
           }
           const value = node.memoizedProps?.value;
           if (value?.state?.stats && typeof value.setState === 'function' &&
               (!context || value.state.now >= context.state.now)) context = value;
         }
       }
-      if (found && context) return { engine: found, context, report };
+      if (found && context) return { engine: found, context, report, exit };
     }
     return null;
   }
@@ -337,11 +372,12 @@
     if (!next) return false;
     bridge = next.context;
     reportKills = next.report;
+    nativeExit = next.exit;
     receive(bridge.state);
     if (engine !== next.engine) {
       restore?.(); restore = null;
       engine = next.engine;
-      if (active) restore = patchEngine(engine, () => cfg, stats);
+      if (active) restore = patchEngine(engine, combatConfig, stats);
     }
     lastBridgeAt = Date.now();
     return true;
@@ -362,16 +398,16 @@
       return Promise.resolve(staleReply());
     }
     const invokedAt = Date.now();
+    const mode = combatConfig().mode;
     const isBattle = path?.startsWith('/api/battle/');
     if (path === '/api/battle/start' || path === '/api/battle/fail') {
-      battleGeneration++;
-      waitingForKills = false; acceptedKills = 0; acceptedWave = null; lastKillReply = null;
+      cancelBattle();
       if (path === '/api/battle/fail') pendingFail = true;
     }
     const generation = battleGeneration;
     let requestBody = {};
     try { requestBody = JSON.parse(init?.body || '{}'); } catch { /* Non-JSON requests are only observed. */ }
-    if (cfg.mode === 'paced' && path === '/api/battle/kills' && engine?.wave &&
+    if (mode === 'paced' && path === '/api/battle/kills' && engine?.wave &&
         requestBody.wave === acceptedWave && requestBody.kills >= engine.wave.cats.length &&
         acceptedKills >= engine.wave.cats.length - 1 && lastKillReply) {
       // Return the last genuine acknowledgement for an unchanged cumulative report.
@@ -389,8 +425,8 @@
       if (auth?.startsWith('tma ')) authorization = auth;
     }
     let wait = 0;
-    if (waveClock && isFast(cfg.mode)) waveClock.accelerated = true;
-    if (active && cfg.mode !== 'farmer' && (isFast(cfg.mode) || waveClock?.accelerated) &&
+    if (waveClock && isFast(mode)) waveClock.accelerated = true;
+    if (active && mode !== 'farmer' && (isFast(mode) || waveClock?.accelerated) &&
         (path === '/api/battle/kills' || path === '/api/battle/clear')) {
       if (!waveClock && engine?.wave) waveClock = { wave: engine.wave, startedAt: invokedAt, accelerated: true };
       let body;
@@ -410,7 +446,9 @@
       if (isBattle && (!installed || generation !== battleGeneration)) {
         return path === '/api/battle/kills' ? Promise.resolve(staleReply()) : parked();
       }
-      return nativeFetch.apply(self, args);
+      if (path !== '/api/battle/clear') return nativeFetch.apply(self, args);
+      clearInFlight++;
+      return Promise.resolve().then(() => nativeFetch.apply(self, args)).finally(() => { clearInFlight--; });
     };
     let promise;
     if (path === '/api/battle/clear' && Number.isFinite(requestBody.wave) &&
@@ -436,12 +474,14 @@
         };
         check();
       }).then(async () => {
+        if (wait > 0) await waitForBattle(Math.max(0, invokedAt + wait - Date.now()), generation);
         const until = Date.now() + 15 * 60000;
         for (;;) {
           if (!installed || generation !== battleGeneration) return parked();
           if (!active) { await new Promise(resolve => setTimeout(resolve, 500)); continue; }
           const response = await send();
-          if (trial?.wave === requestBody.wave) {
+          if (generation !== battleGeneration) return parked();
+          if (trial?.generation === generation) {
             trial.attempts.push({ seconds: Math.round((Date.now() - trial.startedAt) / 100) / 10,
               status: response.status, counted: acceptedKills });
             if (response.ok) {
@@ -455,27 +495,34 @@
           if (error.error !== 'too_fast') { waitingForKills = false; return response; }
           lastBattleError = { path, status: response.status, code: error.error,
             message: String(error.message || ''), at: new Date().toISOString() };
+          if (cfg.mode === 'auto' && automatic.stage === 'push') {
+            automatic.rejection = 'too_fast';
+            note('Сервер отклонил волну. Возвращаюсь к фарму.');
+            return parked();
+          }
           if (Date.now() >= until) {
             waitingForKills = false; stop('Сервер не принял завершение волны за 15 минут.');
             return response;
           }
           note('Сервер ещё не готов завершить волну. Следующая проверка через 30 секунд.');
-          await new Promise(resolve => setTimeout(resolve, 30000));
+          await waitForBattle(30000, generation);
         }
       });
     } else {
       promise = wait > 0
-        ? new Promise(resolve => setTimeout(resolve, wait)).then(send)
+        ? waitForBattle(wait, generation).then(send)
         : send();
     }
     const ownedPromise = promise.then(response => {
-      if (path === '/api/battle/fail') pendingFail = false;
+      if (path === '/api/battle/fail' && generation === battleGeneration) pendingFail = false;
       if (isBattle && generation !== battleGeneration) {
         return path === '/api/battle/kills' ? staleReply() : parked();
       }
       return response;
     });
-    if (path === '/api/battle/fail') ownedPromise.catch(() => { pendingFail = false; });
+    if (path === '/api/battle/fail') ownedPromise.catch(() => {
+      if (generation === battleGeneration) pendingFail = false;
+    });
     if (path) ownedPromise.then(response => {
       if (!installed || (isBattle && generation !== battleGeneration)) return;
       const cacheCopy = path === '/api/battle/kills' ? response.clone() : null;
@@ -483,21 +530,30 @@
         if (active) stop('Сессия истекла. Заново открой игру через Telegram.');
       }
       response.clone().json().then(data => {
-        if (!installed) return;
+        if (!installed || (isBattle && generation !== battleGeneration)) return;
         if (data.state) receive(data.state);
         if (path === '/api/battle/start' && response.ok && data.wave) {
           externallyStale = false;
-          waveClock = { wave: data.wave, startedAt: Date.now(), accelerated: isFast(cfg.mode) };
+          waveClock = { wave: data.wave, startedAt: Date.now(), accelerated: isFast(mode) };
           acceptedWave = data.wave.wave; acceptedKills = 0;
           lastKillReply = null;
           savingUntil = 0;
-          trial = { wave: data.wave.wave, startedAt: Date.now(), mode: cfg.mode, speed: cfg.speed,
+          trial = { generation, wave: data.wave.wave, startedAt: Date.now(), mode, speed: combatConfig().speed,
+            startBalance: data.state?.bananas ?? latest?.bananas,
             stats: data.state?.stats ? { dmg: data.state.stats.dmg, crit: data.state.stats.crit,
               critChance: data.state.stats.crit_chance } : null,
             gear: data.state?.upgrades ? { damage: data.state.upgrades.dmg.level,
               critical: data.state.upgrades.auto.level } : null,
             totalHp: data.wave.cats.reduce((sum, cat) => sum + cat.hp, 0),
             count: data.wave.cats.length, gap: data.wave.gap, attempts: [], killProgress: [] };
+          if (cfg.mode === 'auto' && automatic.stage === 'push') {
+            automatic.wave = data.wave.wave;
+            automatic.deadlineAt = Date.now() + AUTO_TIMEOUT;
+          }
+        }
+        if (path === '/api/battle/clear' && response.ok && cfg.mode === 'auto' &&
+            ['push', 'retreat'].includes(automatic.stage)) {
+          finishAutomatic('cleared');
         }
         if (path === '/api/battle/kills' && response.ok && Number.isFinite(data.counted)) {
           if (acceptedWave !== requestBody.wave) { acceptedWave = requestBody.wave; acceptedKills = 0; }
@@ -516,6 +572,10 @@
             stop('Сервер сбросил бой. Останови другие запуски этого аккаунта и перезагрузи игру.');
           }
           else if (data.error === 'too_fast') {
+            if (cfg.mode === 'auto' && automatic.stage === 'push') {
+              automatic.rejection = 'too_fast';
+              return;
+            }
             // Increase waiting time before the game's own retry. No forged result or time is sent.
             timingPenalty += 15000;
             if (waveClock) {
@@ -589,12 +649,109 @@
     const button = visibleButton(text => /^АВТО\s+ВКЛ$/.test(text));
     if (button) button.click();
   }
+  function finishAutomatic(result) {
+    automatic.history.push({ at: new Date().toISOString(), result,
+      wave: automatic.wave, bananas: latest?.bananas, bestWave: stats.best });
+    if (automatic.history.length > 100) automatic.history.shift();
+    automatic.stage = 'farm'; automatic.deadlineAt = 0; automatic.wave = null;
+    automatic.rejection = null; automatic.exitRequested = false;
+    savingUntil = 0;
+    minimumTransition = 0; actionAt = Date.now() + 100;
+    note(result === 'cleared' ? 'Сервер принял волну. Продолжаю фарм до следующей попытки.' :
+      'Попытка завершена (' + result + '). Продолжаю фарм до следующей проверки.');
+  }
+  function retreatAutomatic(reason, now) {
+    automatic.stage = 'retreat'; automatic.rejection = reason; automatic.retreatAt = now;
+    automatic.exitRequested = false; automatic.pauseRequestedAt = 0; automatic.invalidated = false;
+    note('Возвращаюсь к фарму: ' + reason + '.');
+  }
+  function requestGameExit(owner, now) {
+    // Do not race a clear already being processed by the server with cancellation.
+    if (clearInFlight || pendingFail || owner.exitRequested) return;
+    if (!owner.invalidated) { cancelBattle(); owner.invalidated = true; }
+    if (engine.phase === 'idle') return;
+    const exit = visibleButton(text => text === 'ВЫЙТИ ИЗ ВОЛНЫ');
+    if (exit) { owner.exitRequested = true; exit.click(); return; }
+    const pause = visibleButton((text, b) => b.getAttribute('aria-label') === 'Пауза');
+    if (pause && !owner.pauseRequestedAt) {
+      owner.pauseRequestedAt = now; pause.click(); engine.stop(); return;
+    }
+    // The native React exit callback also works when the local engine has cleared
+    // but the server has not made the victory overlay available yet.
+    if (nativeExit && (!owner.pauseRequestedAt || now - owner.pauseRequestedAt >= 1000)) {
+      owner.exitRequested = true;
+      Promise.resolve().then(() => nativeExit()).catch(e => {
+        if (active) stop('Не удалось выйти из волны: ' + e.message);
+      });
+    }
+  }
+  async function automaticStep(now) {
+    if (['push', 'retreat'].includes(automatic.stage) && automatic.wave !== null && stats.best >= automatic.wave) {
+      finishAutomatic('cleared');
+    }
+    if (automatic.stage === 'push') {
+      if (automatic.rejection || engine.phase === 'failed' || now >= automatic.deadlineAt) {
+        retreatAutomatic(automatic.rejection || (engine.phase === 'failed' ? 'failed' : 'timeout'), now);
+      }
+    }
+    if (automatic.stage === 'retreat') {
+      requestGameExit(automatic, now);
+      if (engine.phase === 'idle' && !pendingFail && !clearInFlight) finishAutomatic(automatic.rejection);
+      else if (now - automatic.retreatAt >= 30000) stop('Не удалось выйти из волны за 30 секунд. Перезапусти makaka.');
+      return true;
+    }
+    if (automatic.stage === 'farm' && now >= automatic.nextAttemptAt) {
+      automatic.stage = 'prepare';
+      note('Три минуты прошли. Завершаю фарм и готовлю попытку волны.');
+    }
+    if (automatic.stage === 'prepare') {
+      if (pendingFail || busy) return true;
+      if (!['idle', 'failed', 'cleared'].includes(engine.phase) || waitingForKills) return false;
+      if (now < nextRequest) return true;
+      if (needsSync) {
+        const result = await request('/api/state');
+        if (result) needsSync = false;
+        return true;
+      }
+      const choice = cfg.autoUpgrade ? chooseCombatUpgrade(latest, 1, cfg.reserve) : null;
+      if (choice) {
+        const result = await request('/api/upgrade', { kind: choice.kind });
+        if (!active) return true;
+        if (!result) return true;
+        stats.spent += choice.cost;
+        note('Перед попыткой куплено одно улучшение: ' + choice.kind + '.');
+      }
+      if (!active || cfg.mode !== 'auto') return true;
+      automatic.stage = 'push'; automatic.attempts++; automatic.wave = null;
+      automatic.nextAttemptAt = Date.now() + AUTO_INTERVAL;
+      automatic.deadlineAt = Date.now() + AUTO_TIMEOUT;
+      automatic.rejection = null;
+      note('Пробую пройти одну волну. Лимит попытки — 90 секунд.');
+    }
+    return false;
+  }
+  async function exitWave() {
+    if (exiting) throw new Error('Выход из волны уже выполняется.');
+    exiting = true;
+    stop('Проверка: выхожу из волны через паузу.');
+    const owner = { exitRequested: false, pauseRequestedAt: 0, invalidated: false };
+    const until = Date.now() + 30000;
+    try {
+      while (engine?.phase !== 'idle' || pendingFail || clearInFlight) {
+        if (Date.now() >= until) throw new Error('Игра не завершила выход из волны за 30 секунд.');
+        requestGameExit(owner, Date.now());
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (!owner.invalidated) cancelBattle();
+      return summary();
+    } finally { exiting = false; }
+  }
   function stop(reason = 'Остановлено. Бой поставлен на паузу.', keepGear = false) {
     active = false;
     if (!keepGear && cfg.gearAuto) { cfg = { ...cfg, gearAuto: false }; saveConfig(); syncControls(); }
     requestAbort?.abort();
     disableBuiltinAuto();
-    if (engine?.phase === 'running') {
+    if (engine && ['running', 'cleared'].includes(engine.phase)) {
       const pause = visibleButton((text, b) => b.getAttribute('aria-label') === 'Пауза');
       pause?.click();
       engine.stop();
@@ -604,6 +761,7 @@
     render();
   }
   function start(options = {}) {
+    if (exiting) { note('Дождись выхода из предыдущей волны.'); return false; }
     if (externallyStale) { note('После сброса сервером нужна перезагрузка игры.'); render(); return false; }
     cfg = cleanConfig({ ...cfg, ...options }); saveConfig(); syncControls();
     visibleButton(text => text === 'Игра')?.click();
@@ -614,9 +772,13 @@
     active = true; startedAt = Date.now(); progressAt = Date.now();
     if (!accountingStartedAt) accountingStartedAt = startedAt;
     errors = 0; backoff = 0; nextRequest = 0; recovering = false; failCount = 0;
-    restore?.(); restore = patchEngine(engine, () => cfg, stats);
+    runtimeFarmKills = 0;
+    automatic.stage = 'farm'; automatic.nextAttemptAt = startedAt + AUTO_INTERVAL;
+    automatic.deadlineAt = 0; automatic.wave = null; automatic.rejection = null;
+    restore?.(); restore = patchEngine(engine, combatConfig, stats);
     disableBuiltinAuto();
-    note(cfg.mode === 'paced' ? 'Проверка: обычные враги у центра, босс получает урон постепенно.' :
+    note(cfg.mode === 'auto' ? 'Автомат: фарм ×8, попытка волны каждые 3 минуты, затем снова фарм.' :
+      cfg.mode === 'paced' ? 'Проверка: обычные враги у центра, босс получает урон постепенно.' :
       cfg.mode === 'farmer' ? 'Фармер включён. Покупки отложены до цели накопления.' :
       cfg.mode === 'survival' ? 'Штатная стрельба и защита от урона включены.' :
       cfg.mode === 'normal' ? 'Автотап и улучшения включены.' : 'Локальный режим «' +
@@ -628,8 +790,8 @@
     const now = Date.now();
     if (now - lastBridgeAt > 800) refreshBridge();
     if (!engine || !latest) return;
-    if (now - startedAt >= cfg.sessionMinutes * 60000) return stop('Заданный сеанс завершён.');
-    if (cfg.mode !== 'farmer' && cfg.targetWave > 0 && stats.best >= cfg.targetWave) return stop('Цель достигнута: сервер сохранил волну ' + stats.best + '.');
+    if (cfg.sessionMinutes > 0 && now - startedAt >= cfg.sessionMinutes * 60000) return stop('Заданный сеанс завершён.');
+    if (!['auto', 'farmer'].includes(cfg.mode) && cfg.targetWave > 0 && stats.best >= cfg.targetWave) return stop('Цель достигнута: сервер сохранил волну ' + stats.best + '.');
     disableBuiltinAuto();
     if (document.hidden) {
       hiddenPause = true;
@@ -637,18 +799,27 @@
       return;
     }
     if (hiddenPause) { hiddenPause = false; progressAt = now; }
+    if (cfg.mode === 'auto') {
+      const handled = await automaticStep(now);
+      if (!active) return;
+      maintainFarmIncome(now);
+      if (handled) return;
+    }
+    const combat = combatConfig(), mode = combat.mode;
     if (cfg.mode === 'farmer') maintainFarmIncome(now);
     const front = engine.cats?.find(c => c.state !== 'dying' && !c.deco);
     const mark = [engine.wave?.wave, engine.phase, engine.killed, front?.hp, stats.best].join(':');
     if (mark !== progressMark) { progressMark = mark; progressAt = now; }
     if (engine.phase === 'running' && engine.running && now - progressAt > 90000) {
+      if (cfg.mode === 'auto') { retreatAutomatic('no_progress', now); return; }
       return stop('Бой не меняется 90 секунд. Проверь окно игры.');
     }
     if (engine.phase !== lastPhase) {
       lastPhase = engine.phase;
       if (lastPhase === 'cleared') {
         minimumTransition = now + 2800;
-        note('Локальный бой завершён. Ожидаю сохранения сервером.');
+        note(stats.best >= engine.wave?.wave ? 'Сервер сохранил пройденную волну.' :
+          'Локальный бой завершён. Ожидаю сохранения сервером.');
       }
       if (lastPhase === 'failed') {
         const wave = engine.wave?.wave;
@@ -667,15 +838,20 @@
       saveConfig(); syncControls();
       note('Цель накопления достигнута. Покупаю улучшения и прохожу волны.');
     }
-    if (cfg.mode === 'farmer' && engine.phase === 'running') {
-      const plan = planForFarm(engine.wave, cfg.speed, cfg.farmKills);
+    if (mode === 'farmer' && engine.phase === 'running') {
+      const plan = planForFarm(engine.wave, combat.speed, combat.farmKills);
       if (plan.kills > 0 && engine.killed >= plan.kills) {
         if (acceptedWave !== engine.wave.wave || acceptedKills < plan.kills) {
-          if (reportKills && earlyReportedWave !== engine.wave) {
+          if (earlyReportedWave !== engine.wave) {
             earlyReportedWave = engine.wave;
-            Promise.resolve().then(() => reportKills()).catch(() => {});
+            farmConfirmStartedAt = now;
+            if (reportKills) Promise.resolve().then(() => reportKills()).catch(() => {});
           }
           message = 'Фарм: сервер подтвердил ' + acceptedKills + '/' + plan.kills + ' убийств.';
+          if (cfg.mode === 'auto' && now - farmConfirmStartedAt >= 30000) {
+            runtimeFarmKills = Math.max(1, Math.min(plan.kills - 1, acceptedKills || plan.kills - 1));
+            retreatAutomatic('farm_confirmation_timeout', now);
+          }
           return;
         }
         const exit = visibleButton(text => text === 'ВЫЙТИ ИЗ ВОЛНЫ');
@@ -705,7 +881,7 @@
         note(resume ? 'Бой продолжен.' : 'Начинаю следующую волну.');
       }
     }
-    if (cfg.mode === 'farmer' || busy || now < nextRequest || !authorization) return;
+    if (['auto', 'farmer'].includes(cfg.mode) || busy || now < nextRequest || !authorization) return;
     if (needsSync) {
       const result = await request('/api/state');
       if (result) needsSync = false;
@@ -777,6 +953,9 @@
     stats.gained = latest && baselineBalance !== null ? latest.bananas - baselineBalance + stats.spent : 0;
     return {
       version: VERSION, active, config: { ...cfg }, message,
+      automation: cfg.mode === 'auto' ? { ...automatic, history: automatic.history.slice(),
+        combatMode: combatConfig().mode,
+        nextAttemptSeconds: Math.max(0, Math.ceil((automatic.nextAttemptAt - Date.now()) / 1000)) } : null,
       server: latest ? { wave: latest.battle.wave, bestWave: latest.battle.max_wave,
         bananas: latest.bananas, upgrades: latest.upgrades } : null,
       battle: engine ? { phase: engine.phase, wave: engine.wave?.wave,
@@ -787,6 +966,7 @@
       lastBattleError,
       serverKills: { wave: acceptedWave, counted: acceptedKills, waiting: waitingForKills },
       farmReportReady: !!reportKills,
+      exitReady: !!nativeExit, battleGeneration, clearInFlight,
       currentTrial: trial ? JSON.parse(JSON.stringify(trial)) : null,
       trials: JSON.parse(JSON.stringify(trials)),
       farmCycles: JSON.parse(JSON.stringify(farmCycles)),
@@ -821,7 +1001,7 @@
       .footer{display:flex;justify-content:space-between}.footer button{border:0;background:none;font-size:11px;padding:3px}
     </style>
     <details><summary id="badge">MK Pilot · готов</summary><section>
-      <label>Режим <select id="mode"><option value="farmer">Фармер бананов</option><option value="paced">Бой у центра (опытный)</option><option value="survival">Защита</option><option value="normal">Обычный</option><option value="turbo">Турбо (опытный)</option><option value="maximum">Максимум (опытный)</option></select></label>
+      <label>Режим <select id="mode"><option value="auto">Автомат: фарм + волны</option><option value="farmer">Фармер бананов</option><option value="paced">Бой у центра (опытный)</option><option value="survival">Защита</option><option value="normal">Обычный</option><option value="turbo">Турбо (опытный)</option><option value="maximum">Максимум (опытный)</option></select></label>
       <label>Скорость боя <select id="speed"><option value="1">×1</option><option value="2">×2</option><option value="4">×4</option><option value="8">×8</option></select></label>
       <small id="explain"></small>
       <div id="data">Ожидаю загрузки игры…</div>
@@ -832,7 +1012,7 @@
       <label>Резерв бананов <input id="reserve" type="number" min="0" step="1000"></label>
       <label>Копить до (0 — без конца) <input id="farmTarget" type="number" min="0" step="10000"></label>
       <label>Цель: волна (0 — без цели) <input id="targetWave" type="number" min="0"></label>
-      <label>Длительность, минут <input id="sessionMinutes" type="number" min="1" max="1440"></label>
+      <label>Минут (0 — без конца) <input id="sessionMinutes" type="number" min="0" max="1440"></label>
       <div class="row"><button id="start">Запустить</button><button id="stop" class="stop">Стоп</button></div>
       <div id="msg"></div>
       <small>Скрытая вкладка ставит игру на паузу. Звёзды и казино не используются.</small>
@@ -859,10 +1039,13 @@
     if (!shadow) return;
     shadow.getElementById('mode').disabled = active;
     shadow.getElementById('speed').disabled = active;
+    shadow.getElementById('gearAuto').disabled = cfg.mode === 'auto';
     const wave = latest?.battle.max_wave;
     shadow.getElementById('badge').textContent = 'MK Pilot · ' + (active ? 'работает' : 'стоп') +
       (wave != null ? ' · рекорд ' + wave : '');
-    shadow.getElementById('explain').textContent = cfg.mode === 'paced'
+    shadow.getElementById('explain').textContent = cfg.mode === 'auto'
+      ? 'Фарм ×8. Каждые 3 минуты — одно улучшение и попытка волны до 90 секунд. Затем снова фарм.'
+      : cfg.mode === 'paced'
       ? 'Обычные враги погибают у центра. Босс теряет здоровье по мере движения. Зачёт подтверждает сервер.'
       : cfg.mode === 'farmer'
       ? 'Убиваю выгодную пачку, жду зачёта награды и перезапускаю бой. Покупки — после накопления цели.'
@@ -878,7 +1061,9 @@
       ? 'Сохранённая волна: ' + n(latest.battle.max_wave) + '\nБананы: ' + n(latest.bananas) +
         '\nБой: ' + n(engine?.wave?.wave || latest.battle.wave) + ' · ' + n(engine?.killed) + '/' + n(engine?.wave?.cats?.length) +
         '\nЗдоровье: ' + n(engine?.hp) + '/' + n(engine?.maxHp) +
-        '\nФарм: ' + n(stats.farmCycles) + ' забегов · ' + n(summary().incomePerMinute) + '/мин'
+        '\nФарм: ' + n(stats.farmCycles) + ' забегов · ' + n(summary().incomePerMinute) + '/мин' +
+        (cfg.mode === 'auto' ? '\nАвтомат: ' + ({ farm: 'фарм', prepare: 'подготовка', push: 'попытка волны', retreat: 'возврат к фарму' }[automatic.stage]) +
+          ' · попытка через ' + n(summary().automation.nextAttemptSeconds) + ' с' : '')
       : 'Ожидаю загрузки игры…';
     const waitSeconds = Math.max(0, Math.ceil((savingUntil - Date.now()) / 1000));
     shadow.getElementById('msg').textContent = waitingForKills
@@ -886,7 +1071,7 @@
       : waitSeconds > 0 ? 'Сохранение прогресса: ожидание ' + waitSeconds + ' с по времени появления противников.' : message;
     for (const button of document.querySelectorAll('main button')) {
       if (/^(Урон|Крит|Хилки)(?:\s|$)/.test(button.innerText.trim())) {
-        if (active && cfg.mode === 'farmer') { button.dataset.mkFarmLocked = '1'; button.disabled = true; }
+        if (active && ['auto', 'farmer'].includes(cfg.mode)) { button.dataset.mkFarmLocked = '1'; button.disabled = true; }
         else if (button.dataset.mkFarmLocked) { delete button.dataset.mkFarmLocked; button.disabled = false; }
       }
     }
@@ -906,7 +1091,7 @@
     delete window.MakakaPilot;
   }
   const api = {
-    version: VERSION, start, stop, status: summary, uninstall,
+    version: VERSION, start, stop, exitWave, status: summary, uninstall,
     configure(options) {
       cfg = cleanConfig({ ...cfg, ...options }); saveConfig();
       syncControls();
@@ -927,9 +1112,10 @@
   loopTimer = setInterval(() => {
     buildPanel();
     const now = Date.now();
-    if (active && now - lastStepAt >= (cfg.mode === 'farmer' ? 100 : 250)) {
+    if (active && !stepping && now - lastStepAt >= (['auto', 'farmer'].includes(cfg.mode) ? 100 : 250)) {
       lastStepAt = now;
-      step().catch(e => stop('Ошибка контроллера: ' + e.message));
+      stepping = true;
+      step().catch(e => stop('Ошибка контроллера: ' + e.message)).finally(() => { stepping = false; });
     }
   }, 100);
   renderTimer = setInterval(() => { if (!active) refreshBridge(); render(); }, 1000);
@@ -973,7 +1159,7 @@
   const timer = setInterval(() => {
     if (window.MakakaPilot !== pilot) { clearInterval(timer); return; }
     const s = pilot.status();
-    if (!s.config.gearAuto || !s.server || !s.battle) { stage = 'idle'; return; }
+    if (!s.config.gearAuto || s.config.mode === 'auto' || !s.server || !s.battle) { stage = 'idle'; return; }
     if (s.server.bestWave >= s.config.targetWave && s.config.targetWave > 0) {
       stage = 'done'; return;
     }
