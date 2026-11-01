@@ -3,6 +3,7 @@ node_modules/
 *.session
 *.log
 launch.json
+telegram.json
 status.json
 browser/
 .state/
