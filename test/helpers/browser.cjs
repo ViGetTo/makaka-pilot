@@ -1,17 +1,18 @@
 const vm = require('node:vm');
 const fs = require('node:fs');
 
-module.exports = function browser({ clearAccepted = false, killLimit = 4, holdClear = false } = {}) {
+module.exports = function browser({ clearAccepted = false, killLimit = 4, holdClear = false,
+  damageCost = 2000000, bananas = 1000000, clearError = 'too_fast', clearStatus = 409, top = {}, topStatus = 200 } = {}) {
   let now = 1000000, tick, timerId = 0, paused = false, phase = 'idle', reported = 0;
   const timers = new Map(), sent = [];
   let releaseClear;
   const clearGate = holdClear ? new Promise(resolve => { releaseClear = resolve; }) : Promise.resolve();
-  let state = { now: 1000, bananas: 1000000, battle: { wave: 65, max_wave: 64 },
+  let state = { now: 1000, bananas, battle: { wave: 65, max_wave: 64 },
     stats: { dmg: 100, crit: 2, crit_chance: .2, hp: 100, gen: 0, tap: 22,
       regen: 0, energy_max: 300, storage_hours: 3,
       next: { dmg: 120, crit: 2.2, crit_chance: .21, hp: 110 } },
     mine: { energy: 0, since: 1000 },
-    upgrades: { dmg: { level: 1, cost: 100 }, auto: { level: 1, cost: 200 }, hp: { level: 1, cost: 300 } } };
+    upgrades: { dmg: { level: 1, cost: damageCost }, auto: { level: 1, cost: 50 }, hp: { level: 1, cost: 300 } } };
   const canvas = {}, engine = { canvas, phase: 'idle', running: false, killed: 0, hp: 100, maxHp: 100, cats: [],
     update() {}, hurtMonkey() {}, damage(cat, amount) { cat.hp -= amount; }, tap() {}, shoot() {}, frontCats() { return []; },
     stop() { this.running = false; }, showIdle() { this.phase = 'idle'; this.wave = null; phase = 'idle'; paused = false; } };
@@ -53,7 +54,7 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
       addEventListener() {}, removeEventListener() {} },
     async fetch(input, init) {
       const path = new URL(input, 'https://makaka.wivvi.net').pathname;
-      const body = JSON.parse(init?.body || '{}'); sent.push({ path, body });
+      const body = JSON.parse(init?.body || '{}'); sent.push({ path, body, method: init?.method });
       state = { ...state, now: state.now + 1 };
       let data = {}, status = 200;
       if (path.endsWith('/start')) {
@@ -65,11 +66,16 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
         state.bananas += Math.max(0, data.counted - reported) * 10;
       } else if (path.endsWith('/clear')) {
         await clearGate;
-        if (!clearAccepted) { status = 409; data = { error: 'too_fast' }; }
+        if (!clearAccepted) { status = clearStatus; data = { error: clearError }; }
         else { state.battle = { wave: state.battle.wave + 1, max_wave: state.battle.wave }; phase = 'cleared'; }
+      } else if (path === '/api/top') {
+        data = top[new URL(input, 'https://makaka.wivvi.net').searchParams.get('by')]; status = topStatus;
       } else if (path === '/api/upgrade') {
         state.bananas -= state.upgrades[body.kind].cost;
         state.upgrades = structuredClone(state.upgrades); state.upgrades[body.kind].level++;
+        state.upgrades[body.kind].cost *= 2;
+        if (body.kind === 'dmg') state.stats = { ...state.stats, dmg: state.stats.next.dmg,
+          next: { ...state.stats.next, dmg: Math.ceil(state.stats.next.dmg * 1.2) } };
       }
       provider.state = state;
       return new Response(JSON.stringify({ ...data, state }), { status });
@@ -87,7 +93,12 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
   const start = options => pilot.start({ mode: 'auto', mine: false, collect: false,
     autoUpgrade: false, farmKills: 2, sessionMinutes: 0, ...options });
   return { context, pilot, engine, sent, start, advance, flush, releaseClear,
-    async enterPush(options) { start(options); await advance(180000); },
+    async enterPush(options) { start(options); await advance(100); },
+    async earn(amount) {
+      state = { ...state, now: state.now + 1, bananas: state.bananas + amount };
+      provider.state = state;
+      await context.fetch('/api/state'); await flush();
+    },
     async clear() {
       engine.killed = engine.wave.cats.length; engine.phase = 'cleared';
       const progress = backend.battleKills(); await advance(6500); await progress; await flush();

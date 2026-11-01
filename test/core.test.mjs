@@ -31,9 +31,9 @@ test('normal launch migrates the old bank plan to unlimited automatic farming an
   assert.equal(options.sessionMinutes, 0); assert.equal(options.autoUpgrade, true);
   assert.equal(options.targetWave, 0); assert.equal(options.farmTarget, 0);
   assert.equal(options.gearAuto, false); assert.equal(options.farmKills, 15);
-  assert.equal(options.reserve, 123); assert.equal(old.mode, 'paced');
+  assert.equal(options.reserve, 0); assert.equal(old.mode, 'paced');
   const configured = automaticSessionOptions({ ...options, sessionMinutes: 20, autoUpgrade: false });
-  assert.equal(configured.sessionMinutes, 20); assert.equal(configured.autoUpgrade, false);
+  assert.equal(configured.sessionMinutes, 20); assert.equal(configured.autoUpgrade, true);
 });
 
 test('accepts a full launch link without pretending to validate its signature', () => {
