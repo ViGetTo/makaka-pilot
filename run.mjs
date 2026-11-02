@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ORIGIN, DEFAULT_OPTIONS, automaticSessionOptions, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
 import { tuneFarm } from './lib/tuning.mjs';
 import { probeFastRestart } from './lib/probe.mjs';
+import { probeTapBoost } from './lib/income.mjs';
 import { createTelegramProvider, telegramCredentials } from './lib/telegram.mjs';
 import { gameAuthError, saveTelegramLaunch, withRenewedLaunch } from './lib/launch.mjs';
 import { createRankings } from './lib/leaderboard.mjs';
@@ -110,11 +111,11 @@ async function acquire() {
   }
 }
 
-async function run(checkOnly = false, tuning = false, probing = false) {
+async function run(checkOnly = false, tuning = false, probing = false, boosting = false) {
   let config = await readJson(configPath);
   if (!config?.url && config?.authMode !== 'telegram') { await login(); config = await readJson(configPath); }
   if (command === 'farm') config = { ...config, options: farmSessionOptions(config.options) };
-  else if (!checkOnly && !tuning && !probing) config = { ...config, options: automaticSessionOptions(config.options) };
+  else if (!checkOnly && !tuning && !probing && !boosting) config = { ...config, options: automaticSessionOptions(config.options) };
   let url = config.authMode === 'telegram' ? null : validateLaunchUrl(config.url);
   const executablePath = await browserPath();
   await acquire();
@@ -213,6 +214,20 @@ async function run(checkOnly = false, tuning = false, probing = false) {
             console.log(`Отчёт: ${join(stateDir, 'probe.json')}`);
             return;
           }
+          if (boosting) {
+            if (stopping) return;
+            console.log('Проверяю серверную оплату 60 тапов сверх энергии. Сначала расходуется накопленная энергия.');
+            const result = await probeTapBoost(page, { stopped: () => stopping,
+              readStop: async () => !!await readJson(stopPath, false) });
+            await privateJson(join(stateDir, 'income-boost.json'), result);
+            const fresh = await readJson(configPath, config);
+            await privateJson(configPath, { ...fresh, options: { ...DEFAULT_OPTIONS, ...fresh.options,
+              tapBoost: result.verdict === 'boosted' } });
+            console.log(result.message);
+            console.log(`Отчёт: ${join(stateDir, 'income-boost.json')}`);
+            if (result.verdict === 'boosted') console.log('Следующий запуск makaka или makaka farm использует усиление тапов.');
+            return;
+          }
           if (!checkOnly && !stopping) {
             const options = { ...DEFAULT_OPTIONS, ...config.options };
             if (options.sessionMinutes > 0) {
@@ -265,7 +280,8 @@ try {
   } else if (command === 'check') await run(true);
   else if (command === 'tune') await run(false, true);
   else if (command === 'probe') await run(false, false, true);
+  else if (command === 'boost') await run(false, false, false, true);
   else if (command === 'start' || command === 'farm') await run();
   else if (command === 'doctor') console.log(`Node ${process.version}; Chromium: ${await browserPath()}; настройки: ${stateDir}`);
-  else throw new Error('Команды: makaka [start|farm|telegram-login|login|config|tune|probe|check|status|stop|doctor]');
+  else throw new Error('Команды: makaka [start|farm|telegram-login|login|config|tune|probe|boost|check|status|stop|doctor]');
 } catch (e) { console.error(redact(e.message)); process.exitCode = 1; }
