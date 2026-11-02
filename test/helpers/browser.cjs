@@ -2,16 +2,18 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 
 module.exports = function browser({ clearAccepted = false, killLimit = 4, holdClear = false,
-  damageCost = 2000000, bananas = 1000000, clearError = 'too_fast', clearStatus = 409, top = {}, topStatus = 200 } = {}) {
+  damageCost = 2000000, bananas = 1000000, clearError = 'too_fast', clearStatus = 409, top = {}, topStatus = 200,
+  energy = 0, regen = 0, tapPolicy = 'clamp', tapStatus = 200, incomeVerifyDelta = 0 } = {}) {
   let now = 1000000, tick, timerId = 0, paused = false, phase = 'idle', reported = 0;
   const timers = new Map(), sent = [];
+  let incomeRequests = 0;
   let releaseClear;
   const clearGate = holdClear ? new Promise(resolve => { releaseClear = resolve; }) : Promise.resolve();
   let state = { now: 1000, bananas, battle: { wave: 65, max_wave: 64 },
     stats: { dmg: 100, crit: 2, crit_chance: .2, hp: 100, gen: 0, tap: 22,
-      regen: 0, energy_max: 300, storage_hours: 3,
+      regen, energy_max: 300, storage_hours: 3,
       next: { dmg: 120, crit: 2.2, crit_chance: .21, hp: 110 } },
-    mine: { energy: 0, since: 1000 },
+    mine: { energy, since: 1000 },
     upgrades: { dmg: { level: 1, cost: damageCost }, auto: { level: 1, cost: 50 }, hp: { level: 1, cost: 300 } } };
   const canvas = {}, engine = { canvas, phase: 'idle', running: false, killed: 0, hp: 100, maxHp: 100, cats: [],
     update() {}, hurtMonkey() {}, damage(cat, amount) { cat.hp -= amount; }, tap() {}, shoot() {}, frontCats() { return []; },
@@ -56,6 +58,7 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
       const path = new URL(input, 'https://makaka.wivvi.net').pathname;
       const body = JSON.parse(init?.body || '{}'); sent.push({ path, body, method: init?.method });
       state = { ...state, now: state.now + 1 };
+      state.mine = { ...state.mine, energy: Math.min(state.stats.energy_max, state.mine.energy + state.stats.regen) };
       let data = {}, status = 200;
       if (path.endsWith('/start')) {
         reported = 0;
@@ -68,6 +71,17 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
         await clearGate;
         if (!clearAccepted) { status = clearStatus; data = { error: clearError }; }
         else { state.battle = { wave: state.battle.wave + 1, max_wave: state.battle.wave }; phase = 'cleared'; }
+      } else if (path === '/api/mine/tap') {
+        incomeRequests++;
+        status = tapStatus;
+        if (status !== 200) data = { error: 'energy_limit' };
+        else {
+          const paid = tapPolicy === 'unchecked' ? body.taps : Math.min(body.taps, Math.floor(state.mine.energy));
+          state.bananas += paid * state.stats.tap;
+          state.mine.energy = Math.max(0, state.mine.energy - paid);
+        }
+      } else if (path === '/api/state' && incomeRequests) {
+        state.bananas += incomeVerifyDelta;
       } else if (path === '/api/top') {
         data = top[new URL(input, 'https://makaka.wivvi.net').searchParams.get('by')]; status = topStatus;
       } else if (path === '/api/upgrade') {

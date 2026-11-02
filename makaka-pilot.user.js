@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.10.0
+// @version      2.11.0
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,10 +12,10 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.10.0';
+  const VERSION = '2.11.0';
   const AUTO_INTERVAL = 180000, AUTO_TIMEOUT = 90000;
   const DEFAULTS = {
-    mode: 'auto', speed: 8, autoUpgrade: true, mine: true,
+    mode: 'auto', speed: 8, autoUpgrade: true, mine: true, tapBoost: false,
     collect: true, reserve: 0, targetWave: 0, sessionMinutes: 0, farmTarget: 0, farmKills: 0, gearAuto: false,
   };
   const MODES = new Set(['auto', 'normal', 'survival', 'turbo', 'maximum', 'farmer', 'paced']);
@@ -34,6 +34,7 @@
       speed: finite(value.speed ?? DEFAULTS.speed, DEFAULTS.speed, 1, 8),
       autoUpgrade: mode === 'auto' ? true : (value.autoUpgrade ?? DEFAULTS.autoUpgrade),
       mine: value.mine ?? DEFAULTS.mine,
+      tapBoost: value.tapBoost === true,
       collect: value.collect ?? DEFAULTS.collect,
       reserve: mode === 'auto' ? 0 : finite(value.reserve ?? 0, 0, 0, 1e15),
       targetWave: Math.floor(finite(value.targetWave ?? 0, 0, 0, 1e9)),
@@ -90,8 +91,39 @@
       state.mine.energy + Math.max(0, now - state.now) * s.regen));
   }
 
-  function tapCount(state, now) {
+  function tapCount(state, now, boosted = false) {
+    if (boosted) return 60;
     return Math.max(0, Math.min(60, Math.floor(energyAt(state, now))));
+  }
+
+  function normalTapCeiling(before, after, taps) {
+    // Allow one extra second for rounding of the server's timestamps.
+    return Math.min(taps, Math.floor(energyAt(before, after.now + 1))) * before.stats.tap;
+  }
+  function classifyTapBoost(result) {
+    if (result.error) return { verdict: 'rejected', message: 'Сервер отклонил лишние тапы: ' + result.error + '.' };
+    const { before, after, verified, requested } = result;
+    const valid = s => s && [s.now, s.bananas, s.stats?.tap, s.stats?.regen,
+      s.stats?.energy_max, s.mine?.energy, s.mine?.since].every(Number.isFinite) &&
+      s.stats.tap > 0 && s.stats.regen >= 0 && s.stats.energy_max >= 0 && s.mine.energy >= 0;
+    const context = s => JSON.stringify([s.battle, s.upgrades, s.stats, s.mine?.since]);
+    if (![before, after, verified].every(valid) || !Number.isInteger(requested) || requested < 1 || requested > 60 ||
+        result.interference || after.now < before.now || verified.now < after.now ||
+        context(before) !== context(after) || context(after) !== context(verified) ||
+        after.bananas !== verified.bananas) {
+      return { verdict: 'inconclusive', message: 'Замер неоднозначен: состояние или баланс изменились. Усиление выключено.' };
+    }
+    const gain = after.bananas - before.bananas;
+    const normalMaximum = normalTapCeiling(before, after, requested);
+    if (gain < 0 || gain > requested * before.stats.tap) {
+      return { verdict: 'inconclusive', gain, message: 'В замере есть постороннее изменение баланса. Усиление выключено.' };
+    }
+    if (gain === requested * before.stats.tap && gain > normalMaximum) {
+      return { verdict: 'boosted', gain, normalMaximum, extra: gain - normalMaximum,
+        message: 'Сервер сохранил оплату тапов сверх энергии. Экспериментальное усиление включено.' };
+    }
+    return { verdict: 'capped', gain, normalMaximum,
+      message: 'Дополнительная выплата за тапы не подтверждена. Сервер ограничивает доход; усиление выключено.' };
   }
 
   function economyChoice(state, reserve = 0) {
@@ -240,7 +272,8 @@
   }
 
   const Core = { cleanConfig, combatChoices, chooseCombatUpgrade, chooseDamageUpgrade, energyAt, tapCount,
-    economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, farmLocalLimit, WRITABLE };
+    economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, farmLocalLimit,
+    classifyTapBoost, WRITABLE };
   if (typeof module === 'object' && module.exports) {
     module.exports = Core;
     return;
@@ -277,6 +310,7 @@
   let progressAt = Date.now(), progressMark = '', message = 'Готов. Нажми «Запустить».';
   let minimumTransition = 0, hiddenPause = false, lastBridgeAt = 0;
   let needsSync = false, requestAbort = null;
+  let incomeProbe = null, incomeProbeWrites = 0, lastIncomeProbe = null, tapBoostBlocked = false, stopGeneration = 0;
   let waveClock = null, savingUntil = 0, timingPenalty = 0;
   let lastBattleError = null;
   let acceptedWave = null, acceptedKills = 0, waitingForKills = false;
@@ -400,6 +434,9 @@
   const observedFetch = function (input, init) {
     if (!installed) return nativeFetch.apply(this, arguments);
     const path = apiPath(input);
+    if (incomeProbe && path && path !== '/api/state' && path !== '/api/top' && !path.startsWith('/api/top/')) {
+      incomeProbeWrites++;
+    }
     if (externallyStale && ['/api/battle/kills', '/api/battle/clear'].includes(path)) {
       return Promise.resolve(staleReply());
     }
@@ -639,9 +676,18 @@
   async function request(path, body) {
     if (busy || Date.now() < nextRequest || !active || !authorization) return null;
     busy = true;
+    const boosting = path === '/api/mine/tap' && cfg.tapBoost && !tapBoostBlocked;
+    const before = boosting && latest ? JSON.parse(JSON.stringify(latest)) : null;
     try {
-      return await post(path, body);
+      const result = await post(path, body);
+      if (before && result.state && normalTapCeiling(before, result.state, body.taps) < body.taps * before.stats.tap &&
+          result.state.bananas - before.bananas <= normalTapCeiling(before, result.state, body.taps)) {
+        tapBoostBlocked = true;
+        note('Сервер ограничил выплату энергией. Продолжаю обычные тапы.');
+      }
+      return result;
     } catch (error) {
+      if (boosting) tapBoostBlocked = true;
       if (!active) return null;
       errors++; stats.failures++; needsSync = true;
       backoff = Math.max(error.retry * 1000, Math.min(60000, 2000 * 2 ** Math.min(errors, 5)));
@@ -773,8 +819,70 @@
       return summary();
     } finally { exiting = false; }
   }
+  async function probeIncomeBoost() {
+    if (incomeProbe || busy || exiting) throw new Error('Дождись завершения текущего запроса.');
+    const exit = exitWave(), generation = stopGeneration;
+    await exit;
+    if (generation !== stopGeneration) throw new Error('Проверка усиления остановлена.');
+    if (!installed || !authorization) throw new Error('Нужна действующая сессия игры.');
+    if (busy || incomeProbe) throw new Error('Проверка уже выполняется.');
+    const owner = { cancelled: false };
+    incomeProbe = owner; incomeProbeWrites = 0; busy = true;
+    cfg = { ...cfg, tapBoost: false }; saveConfig(); syncControls();
+    const result = { measuredAt: new Date().toISOString(), version: VERSION, requested: 60, drained: 0 };
+    const check = () => {
+      if (!installed || owner.cancelled) throw new Error('Проверка усиления остановлена.');
+    };
+    const readState = async (path, body) => {
+      check();
+      const data = await post(path, body);
+      check();
+      const state = data.state;
+      if (!state?.stats || !state.mine || !Number.isFinite(state.bananas) || !Number.isFinite(state.now)) {
+        throw new Error('Сервер вернул неполное состояние добычи.');
+      }
+      return JSON.parse(JSON.stringify(state));
+    };
+    const pause = async () => { await new Promise(resolve => setTimeout(resolve, 1200)); check(); };
+    try {
+      note('Проверяю оплату лишних тапов после расхода доступной энергии.');
+      let state = await readState('/api/state');
+      // Spend existing energy normally so a full energy bar cannot look like a boost.
+      for (let i = 0; i < 8; i++) {
+        const taps = tapCount(state, state.now);
+        if (!taps) break;
+        await pause();
+        state = await readState('/api/mine/tap', { taps });
+        result.drained += taps;
+      }
+      result.before = state;
+      if (energyAt(state, state.now) >= 1) {
+        result.interference = true;
+      } else {
+        await pause();
+        try { result.after = await readState('/api/mine/tap', { taps: result.requested }); }
+        catch (error) {
+          check();
+          if ([401, 403, 429].includes(error.status) || !error.status) throw error;
+          result.error = String(error.message);
+        }
+        await pause();
+        result.verified = await readState('/api/state');
+      }
+      result.interference = result.interference || incomeProbeWrites > 0;
+      Object.assign(result, classifyTapBoost(result));
+      cfg = { ...cfg, tapBoost: result.verdict === 'boosted' };
+      tapBoostBlocked = !cfg.tapBoost;
+      saveConfig(); syncControls();
+      lastIncomeProbe = result;
+      note(result.message);
+      return result;
+    } finally { incomeProbe = null; busy = false; render(); }
+  }
   function stop(reason = 'Остановлено. Бой поставлен на паузу.', keepGear = false) {
+    stopGeneration++;
     active = false;
+    if (incomeProbe) incomeProbe.cancelled = true;
     if (!keepGear && cfg.gearAuto) { cfg = { ...cfg, gearAuto: false }; saveConfig(); syncControls(); }
     requestAbort?.abort();
     disableBuiltinAuto();
@@ -788,6 +896,7 @@
     render();
   }
   function start(options = {}) {
+    if (incomeProbe) { note('Дождись проверки усиления тапов.'); return false; }
     if (exiting) { note('Дождись выхода из предыдущей волны.'); return false; }
     if (externallyStale) { note('После сброса сервером нужна перезагрузка игры.'); render(); return false; }
     cfg = cleanConfig({ ...cfg, ...options }); saveConfig(); syncControls();
@@ -951,7 +1060,7 @@
       }
     }
     if (cfg.mine) {
-      const taps = tapCount(latest, serverNow);
+      const taps = tapCount(latest, serverNow, cfg.tapBoost && !tapBoostBlocked);
       if (taps > 0) await request('/api/mine/tap', { taps });
     }
   }
@@ -972,7 +1081,7 @@
       autoAt = now + 5000;
       request('/api/mine/auto');
     } else if (cfg.mine) {
-      const taps = tapCount(latest, serverNow);
+      const taps = tapCount(latest, serverNow, cfg.tapBoost && !tapBoostBlocked);
       if (taps > 0) request('/api/mine/tap', { taps });
     }
   }
@@ -981,6 +1090,8 @@
     stats.gained = latest && baselineBalance !== null ? latest.bananas - baselineBalance + stats.spent : 0;
     return {
       version: VERSION, active, config: { ...cfg }, message,
+      incomeBoost: { enabled: cfg.tapBoost && !tapBoostBlocked, testing: !!incomeProbe,
+        lastProbe: lastIncomeProbe ? JSON.parse(JSON.stringify(lastIncomeProbe)) : null },
       automation: cfg.mode === 'auto' ? { ...automatic, history: automatic.history.slice(),
         combatMode: combatConfig().mode,
         nextAttemptSeconds: automatic.nextAttemptAt ? Math.max(0, Math.ceil((automatic.nextAttemptAt - Date.now()) / 1000)) : null,
@@ -1038,6 +1149,7 @@
       <label>Покупать боевые улучшения <input id="autoUpgrade" type="checkbox"></label>
       <label>Подбирать снаряжение для босса <input id="gearAuto" type="checkbox"></label>
       <label>Автокликер бананов <input id="mine" type="checkbox"></label>
+      <small id="tapBoostStatus"></small>
       <label>Собирать генератор <input id="collect" type="checkbox"></label>
       <label>Резерв бананов <input id="reserve" type="number" min="0" step="1000"></label>
       <label>Копить до (0 — без конца) <input id="farmTarget" type="number" min="0" step="10000"></label>
@@ -1072,6 +1184,8 @@
     shadow.getElementById('gearAuto').disabled = cfg.mode === 'auto';
     shadow.getElementById('autoUpgrade').disabled = cfg.mode === 'auto';
     shadow.getElementById('reserve').disabled = cfg.mode === 'auto';
+    shadow.getElementById('tapBoostStatus').textContent = incomeProbe ? 'Проверяю оплату лишних тапов…'
+      : cfg.tapBoost && !tapBoostBlocked ? 'Опытное усиление: 60 тапов за запрос сверх энергии.' : 'Тапы: по доступной энергии.';
     const wave = latest?.battle.max_wave;
     shadow.getElementById('badge').textContent = 'MK Pilot · ' + (active ? 'работает' : 'стоп') +
       (wave != null ? ' · рекорд ' + wave : '');
@@ -1123,7 +1237,7 @@
     delete window.MakakaPilot;
   }
   const api = {
-    version: VERSION, start, stop, exitWave, status: summary, uninstall,
+    version: VERSION, start, stop, exitWave, probeIncomeBoost, status: summary, uninstall,
     async top(by = 'wave') {
       if (!['wave', 'bananas'].includes(by)) throw new Error('Неизвестный вид рейтинга.');
       if (!authorization) throw new Error('Данные входа ещё не получены.');
