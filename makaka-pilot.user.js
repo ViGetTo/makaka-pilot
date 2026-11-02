@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.10.0
+// @version      2.10.1
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.10.0';
+  const VERSION = '2.10.1';
   const AUTO_INTERVAL = 180000, AUTO_TIMEOUT = 90000;
   const DEFAULTS = {
     mode: 'auto', speed: 8, autoUpgrade: true, mine: true,
@@ -290,6 +290,7 @@
   let farmConfirmStartedAt = 0;
   let nativeExit = null, exiting = false, stepping = false, clearInFlight = 0;
   let runtimeFarmKills = 0;
+  let fastRestartProbe = false;
   const battleWaiters = new Set();
   const automatic = { stage: 'prepare', nextAttemptAt: 0, deadlineAt: 0,
     attempts: 0, wave: null, rejection: null, retreatAt: 0, exitRequested: false, cooldownAfterExit: false, history: [] };
@@ -400,6 +401,8 @@
   const observedFetch = function (input, init) {
     if (!installed) return nativeFetch.apply(this, arguments);
     const path = apiPath(input);
+    // The diagnostic measures kill payouts only; a clear bonus changes the wave.
+    if (fastRestartProbe && path === '/api/battle/clear') return parked();
     if (externallyStale && ['/api/battle/kills', '/api/battle/clear'].includes(path)) {
       return Promise.resolve(staleReply());
     }
@@ -432,7 +435,7 @@
     }
     let wait = 0;
     if (waveClock && isFast(mode)) waveClock.accelerated = true;
-    if (active && mode !== 'farmer' && (isFast(mode) || waveClock?.accelerated) &&
+    if (active && !fastRestartProbe && mode !== 'farmer' && (isFast(mode) || waveClock?.accelerated) &&
         (path === '/api/battle/kills' || path === '/api/battle/clear')) {
       if (!waveClock && engine?.wave) waveClock = { wave: engine.wave, startedAt: invokedAt, accelerated: true };
       let body;
@@ -525,10 +528,23 @@
         ? waitForBattle(wait, generation).then(send)
         : send();
     }
-    const ownedPromise = promise.then(response => {
+    let killReplyData = null;
+    const ownedPromise = promise.then(async response => {
       if (path === '/api/battle/fail' && generation === battleGeneration) pendingFail = false;
       if (isBattle && generation !== battleGeneration) {
         return path === '/api/battle/kills' ? staleReply() : parked();
+      }
+      if (path === '/api/battle/kills') {
+        // Preserve the receipt before the caller can exit and invalidate this generation.
+        killReplyData = await response.clone().json().catch(() => null);
+        if (!installed || generation !== battleGeneration) return staleReply();
+        if (killReplyData && trial?.wave === requestBody.wave) {
+          trial.killReports.push({ generation, wave: requestBody.wave, reported: requestBody.kills,
+            counted: Number.isFinite(killReplyData.counted) ? killReplyData.counted : null, status: response.status,
+            seconds: Math.round((Date.now() - trial.startedAt) / 100) / 10,
+            error: killReplyData.error ? String(killReplyData.error) : null });
+          if (trial.killReports.length > 100) trial.killReports.shift();
+        }
       }
       return response;
     });
@@ -541,8 +557,8 @@
       if (response.status === 401 || response.status === 403) {
         if (active) stop('Сессия истекла. Заново открой игру через Telegram.');
       }
-      response.clone().json().then(data => {
-        if (!installed || (isBattle && generation !== battleGeneration)) return;
+      (path === '/api/battle/kills' ? Promise.resolve(killReplyData) : response.clone().json()).then(data => {
+        if (!data || !installed || (isBattle && generation !== battleGeneration)) return;
         if (data.state) receive(data.state);
         if (path === '/api/battle/start' && response.ok && data.wave) {
           externallyStale = false;
@@ -557,7 +573,7 @@
             gear: data.state?.upgrades ? { damage: data.state.upgrades.dmg.level,
               critical: data.state.upgrades.auto.level } : null,
             totalHp: data.wave.cats.reduce((sum, cat) => sum + cat.hp, 0),
-            count: data.wave.cats.length, gap: data.wave.gap, attempts: [], killProgress: [] };
+            count: data.wave.cats.length, gap: data.wave.gap, attempts: [], killProgress: [], killReports: [] };
           if (cfg.mode === 'auto' && automatic.stage === 'push') {
             automatic.attempts++;
             automatic.wave = data.wave.wave;
@@ -757,13 +773,22 @@
     }
     return false;
   }
-  async function exitWave() {
+  async function exitWave({ flushKills = false } = {}) {
     if (exiting) throw new Error('Выход из волны уже выполняется.');
     exiting = true;
     stop('Проверка: выхожу из волны через паузу.');
     const owner = { exitRequested: false, pauseRequestedAt: 0, invalidated: false };
     const until = Date.now() + 30000;
     try {
+      if (flushKills && engine?.wave && engine.phase !== 'idle') {
+        if (!reportKills) throw new Error('Штатный обработчик отчёта об убийствах не обнаружен.');
+        let timer;
+        try {
+          await Promise.race([Promise.resolve().then(() => reportKills()), new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('Не получен ответ на штатный отчёт об убийствах за 8 секунд.')), 8000);
+          })]);
+        } finally { clearTimeout(timer); }
+      }
       while (engine?.phase !== 'idle' || pendingFail || clearInFlight) {
         if (Date.now() >= until) throw new Error('Игра не завершила выход из волны за 30 секунд.');
         requestGameExit(owner, Date.now());
@@ -775,6 +800,7 @@
   }
   function stop(reason = 'Остановлено. Бой поставлен на паузу.', keepGear = false) {
     active = false;
+    fastRestartProbe = false;
     if (!keepGear && cfg.gearAuto) { cfg = { ...cfg, gearAuto: false }; saveConfig(); syncControls(); }
     requestAbort?.abort();
     disableBuiltinAuto();
@@ -790,6 +816,9 @@
   function start(options = {}) {
     if (exiting) { note('Дождись выхода из предыдущей волны.'); return false; }
     if (externallyStale) { note('После сброса сервером нужна перезагрузка игры.'); render(); return false; }
+    const probing = options.probe === 'fast-restart';
+    if (probing) options = { ...options, mode: 'maximum', speed: 8, mine: false, collect: false,
+      autoUpgrade: false, gearAuto: false, farmTarget: 0, targetWave: 0, sessionMinutes: 1 };
     cfg = cleanConfig({ ...cfg, ...options }); saveConfig(); syncControls();
     visibleButton(text => text === 'Игра')?.click();
     if (!refreshBridge()) {
@@ -797,6 +826,7 @@
     }
     if (active) { render(); return true; }
     active = true; startedAt = Date.now(); progressAt = Date.now();
+    fastRestartProbe = probing;
     if (!accountingStartedAt) accountingStartedAt = startedAt;
     errors = 0; backoff = 0; nextRequest = 0; recovering = false; failCount = 0;
     runtimeFarmKills = 0;
@@ -986,7 +1016,12 @@
         nextAttemptSeconds: automatic.nextAttemptAt ? Math.max(0, Math.ceil((automatic.nextAttemptAt - Date.now()) / 1000)) : null,
         attemptSecondsLeft: automatic.deadlineAt ? Math.max(0, Math.ceil((automatic.deadlineAt - Date.now()) / 1000)) : null } : null,
       server: latest ? { wave: latest.battle.wave, bestWave: latest.battle.max_wave,
-        bananas: latest.bananas, upgrades: latest.upgrades, damage: latest.stats.dmg, nextDamage: latest.stats.next?.dmg } : null,
+        bananas: latest.bananas, upgrades: latest.upgrades, damage: latest.stats.dmg, nextDamage: latest.stats.next?.dmg,
+        combat: { crit: latest.stats.crit, critChance: latest.stats.crit_chance, hp: latest.stats.hp,
+          nextCrit: latest.stats.next?.crit, nextCritChance: latest.stats.next?.crit_chance, nextHp: latest.stats.next?.hp },
+        economy: { tap: latest.stats.tap, regen: latest.stats.regen, gen: latest.stats.gen,
+          autoclick: latest.stats.autoclick, autoclickEnabled: latest.features?.autoclick !== false,
+          nextTap: latest.stats.next?.tap, nextGen: latest.stats.next?.gen, nextAutoclick: latest.stats.next?.autoclick } } : null,
       battle: engine ? { phase: engine.phase, wave: engine.wave?.wave,
         hp: engine.hp, maxHp: engine.maxHp, killed: engine.wave ? engine.killed : 0,
         total: engine.wave?.cats?.length ?? 0, paused: !engine.running } : null,

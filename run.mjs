@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ORIGIN, DEFAULT_OPTIONS, automaticSessionOptions, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
+import { ORIGIN, DEFAULT_OPTIONS, automaticSessionOptions, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, measurementBlockedRequest, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
 import { tuneFarm } from './lib/tuning.mjs';
 import { probeFastRestart } from './lib/probe.mjs';
 import { createTelegramProvider, telegramCredentials } from './lib/telegram.mjs';
@@ -161,6 +161,10 @@ async function run(checkOnly = false, tuning = false, probing = false) {
         await page.setUserAgent({ userAgent: normalUserAgent(await browser.userAgent()) });
         await page.setRequestInterception(true);
         page.on('request', request => {
+          // The official client can collect autoclicker income even on the battle tab.
+          if ((tuning || probing) && measurementBlockedRequest(request.url(), request.method())) {
+            request.abort('blockedbyclient').catch(() => {}); return;
+          }
           const headers = filterHeaders(request.url(), request.headers());
           request.continue({ headers }).catch(() => {});
         });

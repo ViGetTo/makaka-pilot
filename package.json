@@ -1,6 +1,6 @@
 {
   "name": "makaka-pilot-termux",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "private": true,
   "type": "module",
   "description": "Запуск Makaka Pilot в Termux с обновлением через GitHub",
