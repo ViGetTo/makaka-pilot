@@ -2,11 +2,14 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 
 module.exports = function browser({ clearAccepted = false, killLimit = 4, holdClear = false,
-  damageCost = 2000000, bananas = 1000000, clearError = 'too_fast', clearStatus = 409, top = {}, topStatus = 200 } = {}) {
+  damageCost = 2000000, bananas = 1000000, clearError = 'too_fast', clearStatus = 409, top = {}, topStatus = 200,
+  failStatus = 200, holdFail = false } = {}) {
   let now = 1000000, tick, timerId = 0, paused = false, phase = 'idle', reported = 0;
   const timers = new Map(), sent = [];
   let releaseClear;
   const clearGate = holdClear ? new Promise(resolve => { releaseClear = resolve; }) : Promise.resolve();
+  let releaseFail;
+  const failGate = holdFail ? new Promise(resolve => { releaseFail = resolve; }) : Promise.resolve();
   let state = { now: 1000, bananas, battle: { wave: 65, max_wave: 64 },
     stats: { dmg: 100, crit: 2, crit_chance: .2, hp: 100, gen: 0, tap: 22,
       regen: 0, energy_max: 300, storage_hours: 3,
@@ -18,6 +21,10 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
     stop() { this.running = false; }, showIdle() { this.phase = 'idle'; this.wave = null; phase = 'idle'; paused = false; } };
   const provider = { state, setState(next) { this.state = next; } };
   const backend = {
+    async battleStart() {
+      const response = await context.fetch('/api/battle/start', { method: 'POST', body: '{}' });
+      return response.json();
+    },
     async battleKills() {
       if (!engine.wave || engine.killed <= reported) return;
       const response = await context.fetch('/api/battle/kills', { method: 'POST',
@@ -28,20 +35,20 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
   };
   const report = async () => backend.battleKills();
   const exit = async () => { await report(); engine.showIdle(); await backend.battleFail(); };
+  const begin = async () => {
+    phase = 'starting';
+    const data = await backend.battleStart();
+    engine.wave = data.wave; engine.killed = 0; engine.phase = 'running'; phase = 'running';
+  };
   canvas.__reactFiber$test = { memoizedState: { memoizedState: { current: engine },
-    next: { memoizedState: [report], next: { memoizedState: [exit], next: null } } },
+    next: { memoizedState: [report], next: { memoizedState: [exit], next: { memoizedState: [begin], next: null } } } },
     memoizedProps: { value: provider } };
   const button = (text, action, label = null) => ({ innerText: text, disabled: false,
     getClientRects: () => [1], getAttribute: () => label, click: action });
   const buttons = () => {
     if (paused) return [button('ПРОДОЛЖИТЬ', () => { paused = false; }), button('ВЫЙТИ ИЗ ВОЛНЫ', exit)];
     if (phase === 'running') return [button('', () => { paused = true; engine.stop(); }, 'Пауза')];
-    return [button('В бой!', async () => {
-      phase = 'starting';
-      const response = await context.fetch('/api/battle/start', { method: 'POST', body: '{}' });
-      const data = await response.json();
-      engine.wave = data.wave; engine.killed = 0; engine.phase = 'running'; phase = 'running';
-    })];
+    return [button('В бой!', begin)];
   };
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
   const context = { URL, URLSearchParams, Headers, Request, Response, AbortController, Blob,
@@ -68,6 +75,10 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
         await clearGate;
         if (!clearAccepted) { status = clearStatus; data = { error: clearError }; }
         else { state.battle = { wave: state.battle.wave + 1, max_wave: state.battle.wave }; phase = 'cleared'; }
+      } else if (path.endsWith('/fail')) {
+        await failGate;
+        status = failStatus;
+        if (status !== 200) data = { error: 'test_exit_error' };
       } else if (path === '/api/top') {
         data = top[new URL(input, 'https://makaka.wivvi.net').searchParams.get('by')]; status = topStatus;
       } else if (path === '/api/upgrade') {
@@ -92,7 +103,7 @@ module.exports = function browser({ clearAccepted = false, killLimit = 4, holdCl
   const pilot = context.MakakaPilot;
   const start = options => pilot.start({ mode: 'auto', mine: false, collect: false,
     autoUpgrade: false, farmKills: 2, sessionMinutes: 0, ...options });
-  return { context, pilot, engine, sent, start, advance, flush, releaseClear,
+  return { context, pilot, engine, sent, start, advance, flush, releaseClear, releaseFail,
     async enterPush(options) { start(options); await advance(100); },
     async earn(amount) {
       state = { ...state, now: state.now + 1, bananas: state.bananas + amount };

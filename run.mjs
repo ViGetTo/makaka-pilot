@@ -11,6 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { ORIGIN, DEFAULT_OPTIONS, automaticSessionOptions, farmSessionOptions, normalUserAgent, validateLaunchUrl, filterHeaders, measurementBlockedRequest, safeStatus, redact, readJson, privateJson } from './lib/core.mjs';
 import { tuneFarm } from './lib/tuning.mjs';
 import { probeFastRestart } from './lib/probe.mjs';
+import { benchmarkFarm } from './lib/benchmark.mjs';
 import { createTelegramProvider, telegramCredentials } from './lib/telegram.mjs';
 import { gameAuthError, saveTelegramLaunch, withRenewedLaunch } from './lib/launch.mjs';
 import { createRankings } from './lib/leaderboard.mjs';
@@ -110,11 +111,11 @@ async function acquire() {
   }
 }
 
-async function run(checkOnly = false, tuning = false, probing = false) {
+async function run(checkOnly = false, tuning = false, probing = false, benchmarking = false) {
   let config = await readJson(configPath);
   if (!config?.url && config?.authMode !== 'telegram') { await login(); config = await readJson(configPath); }
   if (command === 'farm') config = { ...config, options: farmSessionOptions(config.options) };
-  else if (!checkOnly && !tuning && !probing) config = { ...config, options: automaticSessionOptions(config.options) };
+  else if (!checkOnly && !tuning && !probing && !benchmarking) config = { ...config, options: automaticSessionOptions(config.options) };
   let url = config.authMode === 'telegram' ? null : validateLaunchUrl(config.url);
   const executablePath = await browserPath();
   await acquire();
@@ -162,7 +163,7 @@ async function run(checkOnly = false, tuning = false, probing = false) {
         await page.setRequestInterception(true);
         page.on('request', request => {
           // The official client can collect autoclicker income even on the battle tab.
-          if ((tuning || probing) && measurementBlockedRequest(request.url(), request.method())) {
+          if ((tuning || probing || benchmarking) && measurementBlockedRequest(request.url(), request.method())) {
             request.abort('blockedbyclient').catch(() => {}); return;
           }
           const headers = filterHeaders(request.url(), request.headers());
@@ -196,6 +197,21 @@ async function run(checkOnly = false, tuning = false, probing = false) {
       },
       run: async () => {
         try {
+          if (benchmarking && !stopping) {
+            const result = await benchmarkFarm(page, { stopped: () => stopping,
+              readStop: async () => !!await readJson(stopPath, false) });
+            if (!result) { console.log('Сравнение остановлено. Настройки не изменены.'); return; }
+            await privateJson(join(stateDir, 'benchmark.json'), result);
+            if (result.improved) {
+              const fresh = await readJson(configPath, config);
+              await privateJson(configPath, { ...fresh, options: { ...DEFAULT_OPTIONS, ...fresh.options,
+                farmKills: result.selected.farmKills, farmTiming: result.selected.farmTiming } });
+              console.log(`Короткий фарм быстрее на ${Math.round(result.improvement * 100)}%. Настройки сохранены.`);
+            } else console.log('Прирост меньше 5%. Прежние настройки сохранены.');
+            console.log(`Выбранный чистый фарм: ${Math.round(result.selected.perMinute)} бананов/мин. Цель 100000: ${result.goalReached ? 'достигнута в замере пяти циклов' : 'пока не достигнута'}.`);
+            console.log(`Отчёт: ${join(stateDir, 'benchmark.json')}. Продолжить автомат: makaka`);
+            return;
+          }
           if (tuning && !stopping) {
             const ranked = await tuneFarm(page, { stopped: () => stopping,
               readStop: async () => !!await readJson(stopPath, false) });
@@ -203,7 +219,7 @@ async function run(checkOnly = false, tuning = false, probing = false) {
             await privateJson(join(stateDir, 'tuning.json'), { measuredAt: new Date().toISOString(), samples: ranked });
             const fresh = await readJson(configPath, config);
             await privateJson(configPath, { ...fresh, options: { ...DEFAULT_OPTIONS, ...fresh.options,
-              farmKills: ranked[0].kills } });
+              farmKills: ranked[0].kills, farmTiming: 'legacy' } });
             console.log(`Выбрано ${ranked[0].kills} убийств: ${Math.round(ranked[0].perMinute)} бананов/мин в коротком замере. Запуск: makaka`);
             return;
           }
@@ -269,7 +285,8 @@ try {
   } else if (command === 'check') await run(true);
   else if (command === 'tune') await run(false, true);
   else if (command === 'probe') await run(false, false, true);
+  else if (command === 'bench') await run(false, false, false, true);
   else if (command === 'start' || command === 'farm') await run();
   else if (command === 'doctor') console.log(`Node ${process.version}; Chromium: ${await browserPath()}; настройки: ${stateDir}`);
-  else throw new Error('Команды: makaka [start|farm|telegram-login|login|config|tune|probe|check|status|stop|doctor]');
+  else throw new Error('Команды: makaka [start|farm|telegram-login|login|config|tune|probe|bench|check|status|stop|doctor]');
 } catch (e) { console.error(redact(e.message)); process.exitCode = 1; }

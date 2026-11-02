@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.10.1
+// @version      2.11.0
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,11 +12,11 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.10.1';
+  const VERSION = '2.11.0';
   const AUTO_INTERVAL = 180000, AUTO_TIMEOUT = 90000;
   const DEFAULTS = {
     mode: 'auto', speed: 8, autoUpgrade: true, mine: true,
-    collect: true, reserve: 0, targetWave: 0, sessionMinutes: 0, farmTarget: 0, farmKills: 0, gearAuto: false,
+    collect: true, reserve: 0, targetWave: 0, sessionMinutes: 0, farmTarget: 0, farmKills: 0, farmTiming: 'legacy', gearAuto: false,
   };
   const MODES = new Set(['auto', 'normal', 'survival', 'turbo', 'maximum', 'farmer', 'paced']);
   const isFast = mode => ['turbo', 'maximum', 'farmer', 'paced'].includes(mode);
@@ -40,6 +40,7 @@
       sessionMinutes: finite(value.sessionMinutes ?? 0, 0, 0, 1440),
       farmTarget: finite(value.farmTarget ?? 0, 0, 0, 1e15),
       farmKills: Math.floor(finite(value.farmKills ?? 0, 0, 0, 1000)),
+      farmTiming: value.farmTiming === 'spawn' ? 'spawn' : 'legacy',
       gearAuto: value.mode === 'auto' ? false : (value.gearAuto ?? false),
     };
   }
@@ -148,6 +149,19 @@
     }
     return best;
   }
+  function farmReportAt(wave, kills, requestedAt) {
+    if (!wave?.cats?.length || !Number.isFinite(wave.gap) || wave.gap <= 0 ||
+        !Number.isInteger(kills) || kills < 1 || kills > wave.cats.length || !Number.isFinite(requestedAt)) return null;
+    return requestedAt + Math.round((0.5 + (kills - 1) * wave.gap) * 1000) + 60;
+  }
+  function eliteFarmCandidate(wave) {
+    if (!wave?.cats?.length || !Number.isFinite(wave.gap) || wave.gap <= 0) return null;
+    const index = wave.cats.findIndex(cat => cat.kind === 'elite');
+    if (index < 0 || index + 1 > farmLocalLimit(wave)) return null;
+    const reward = wave.cats.slice(0, index + 1).reduce((sum, cat) => sum + Number(cat.reward), 0);
+    if (!Number.isFinite(reward) || reward <= 0) return null;
+    return { kills: index + 1, reward, spawnSeconds: Math.round((0.5 + index * wave.gap) * 1000) / 1000 };
+  }
   const farmPlans = new WeakMap();
   function planForFarm(wave, speed, kills = 0) {
     if (!wave) return { kills: 0, reward: 0, estimate: 0 };
@@ -240,7 +254,7 @@
   }
 
   const Core = { cleanConfig, combatChoices, chooseCombatUpgrade, chooseDamageUpgrade, energyAt, tapCount,
-    economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, farmLocalLimit, WRITABLE };
+    economyChoice, patchEngine, battleNotBefore, casinoExpected, farmPrefix, farmLocalLimit, farmReportAt, eliteFarmCandidate, WRITABLE };
   if (typeof module === 'object' && module.exports) {
     module.exports = Core;
     return;
@@ -291,6 +305,9 @@
   let nativeExit = null, exiting = false, stepping = false, clearInFlight = 0;
   let runtimeFarmKills = 0;
   let fastRestartProbe = false;
+  let nativeStart = null, farmExitPending = false, lastFailReply = null;
+  let farmReportTimer = null, farmScheduledGeneration = null, recordedFarmGeneration = null;
+  let farmCycleLimit = 0, farmSessionBase = 0, farmSessionComplete = false, stoppedAt = 0;
   const battleWaiters = new Set();
   const automatic = { stage: 'prepare', nextAttemptAt: 0, deadlineAt: 0,
     attempts: 0, wave: null, rejection: null, retreatAt: 0, exitRequested: false, cooldownAfterExit: false, history: [] };
@@ -301,6 +318,7 @@
       farmKills: runtimeFarmKills || cfg.farmKills, retreating: automatic.stage === 'retreat' };
   }
   function cancelBattle() {
+    clearFarmReport();
     battleGeneration++;
     waitingForKills = false; acceptedKills = 0; acceptedWave = null; lastKillReply = null;
     savingUntil = 0;
@@ -339,7 +357,7 @@
     const canvases = document.querySelectorAll('main canvas');
     for (const canvas of canvases) {
       const key = Object.keys(canvas).find(k => k.startsWith('__reactFiber$'));
-      let f = key && canvas[key], found = null, context = null, report = null, exit = null;
+      let f = key && canvas[key], found = null, context = null, report = null, exit = null, begin = null;
       for (let depth = 0; f && depth < 30; depth++, f = f.return) {
         for (const node of [f, f.alternate]) {
           if (!node) continue;
@@ -353,6 +371,7 @@
               const source = Function.prototype.toString.call(callback);
               if (source.includes('.battleKills(')) report = callback;
               if (source.includes('.battleFail(') && source.includes('.showIdle(')) exit = callback;
+              if (source.includes('.battleStart(')) begin = callback;
             }
           }
           const value = node.memoizedProps?.value;
@@ -360,7 +379,7 @@
               (!context || value.state.now >= context.state.now)) context = value;
         }
       }
-      if (found && context) return { engine: found, context, report, exit };
+      if (found && context) return { engine: found, context, report, exit, begin };
     }
     return null;
   }
@@ -380,6 +399,7 @@
     bridge = next.context;
     reportKills = next.report;
     nativeExit = next.exit;
+    nativeStart = next.begin;
     receive(bridge.state);
     if (engine !== next.engine) {
       restore?.(); restore = null;
@@ -530,7 +550,9 @@
     }
     let killReplyData = null;
     const ownedPromise = promise.then(async response => {
-      if (path === '/api/battle/fail' && generation === battleGeneration) pendingFail = false;
+      if (path === '/api/battle/fail' && generation === battleGeneration) {
+        pendingFail = false; lastFailReply = { generation, ok: response.ok, status: response.status };
+      }
       if (isBattle && generation !== battleGeneration) {
         return path === '/api/battle/kills' ? staleReply() : parked();
       }
@@ -562,11 +584,11 @@
         if (data.state) receive(data.state);
         if (path === '/api/battle/start' && response.ok && data.wave) {
           externallyStale = false;
-          waveClock = { wave: data.wave, startedAt: Date.now(), accelerated: isFast(mode) };
+          waveClock = { wave: data.wave, startedAt: Date.now(), requestedAt: invokedAt, accelerated: isFast(mode) };
           acceptedWave = data.wave.wave; acceptedKills = 0;
           lastKillReply = null;
           savingUntil = 0;
-          trial = { generation, wave: data.wave.wave, startedAt: Date.now(), mode, speed: combatConfig().speed,
+          trial = { generation, wave: data.wave.wave, startedAt: Date.now(), requestedAt: invokedAt, mode, speed: combatConfig().speed,
             startBalance: data.state?.bananas ?? latest?.bananas,
             stats: data.state?.stats ? { dmg: data.state.stats.dmg, crit: data.state.stats.crit,
               critChance: data.state.stats.crit_chance } : null,
@@ -695,6 +717,73 @@
     const button = visibleButton(text => /^АВТО\s+ВКЛ$/.test(text));
     if (button) button.click();
   }
+  function clearFarmReport() {
+    if (farmReportTimer !== null) clearTimeout(farmReportTimer);
+    farmReportTimer = null; farmScheduledGeneration = null;
+  }
+  function recordFarmCycle(plan, now) {
+    if (recordedFarmGeneration === battleGeneration) return false;
+    recordedFarmGeneration = battleGeneration;
+    stats.farmCycles++;
+    farmCycles.push({ at: new Date().toISOString(), wave: engine.wave.wave,
+      kills: acceptedKills, targetKills: plan.kills,
+      reward: engine.wave.cats.slice(0, acceptedKills).reduce((sum, cat) => sum + cat.reward, 0),
+      seconds: trial ? Math.round((now - trial.startedAt) / 100) / 10 : null,
+      bananas: latest.bananas });
+    if (farmCycles.length > 100) farmCycles.shift();
+    return true;
+  }
+  function completeFarmSession() {
+    if (!farmCycleLimit || stats.farmCycles - farmSessionBase < farmCycleLimit || engine.phase !== 'idle' || pendingFail) return false;
+    farmSessionComplete = true;
+    stop('Заданные циклы фарма завершены и сохранены.');
+    return true;
+  }
+  function fastFarmExit(plan, now) {
+    if (!active || farmExitPending || pendingFail || !nativeExit || !engine.wave ||
+        acceptedWave !== engine.wave.wave || acceptedKills < plan.kills || engine.killed < plan.kills) return false;
+    if (!recordFarmCycle(plan, now)) return true;
+    farmExitPending = true;
+    const previousFail = lastFailReply;
+    const timeout = setTimeout(() => {
+      if (active && farmExitPending) stop('Перезапуск волны не завершился за 15 секунд. Перезапусти makaka.');
+    }, 15000);
+    Promise.resolve().then(() => nativeExit()).then(async () => {
+      if (!installed || !active) return;
+      if (lastFailReply === previousFail || !lastFailReply?.ok) throw new Error('Сервер не подтвердил выход из волны.');
+      if (completeFarmSession()) return;
+      const farming = cfg.mode === 'farmer' || cfg.mode === 'auto' && automatic.stage === 'farm' && Date.now() < automatic.nextAttemptAt;
+      if (farming && nativeStart && !document.hidden) {
+        stats.starts++; actionAt = Date.now() + 2200;
+        await nativeStart();
+        actionAt = Date.now() + 100; progressAt = Date.now();
+        if (active) note('Короткий фарм: награда сохранена, следующая волна запущена.');
+      }
+    }).catch(error => { if (active) stop('Короткий фарм остановлен: ' + error.message); })
+      .finally(() => { clearTimeout(timeout); farmExitPending = false; });
+    return true;
+  }
+  function scheduleFarmReport(plan) {
+    if (farmScheduledGeneration === battleGeneration || !reportKills) return;
+    const generation = battleGeneration;
+    const at = farmReportAt(engine.wave, plan.kills, trial?.requestedAt ?? waveClock?.requestedAt ?? waveClock?.startedAt);
+    if (at === null) return;
+    farmScheduledGeneration = generation;
+    const sendReport = () => {
+      farmReportTimer = null;
+      const combat = combatConfig();
+      if (!installed || !active || generation !== battleGeneration || document.hidden || combat.mode !== 'farmer' ||
+          combat.farmTiming !== 'spawn' || engine.phase !== 'running' || engine.killed < plan.kills) {
+        if (generation === battleGeneration) farmScheduledGeneration = null;
+        return;
+      }
+      Promise.resolve().then(() => reportKills()).then(() => {
+        if (active && generation === battleGeneration) fastFarmExit(plan, Date.now());
+      }).catch(error => { if (active) note('Штатный отчёт не завершён: ' + error.message); });
+    };
+    if (at <= Date.now()) sendReport();
+    else farmReportTimer = setTimeout(sendReport, at - Date.now());
+  }
   function finishAutomatic(result) {
     automatic.history.push({ at: new Date().toISOString(), result,
       wave: automatic.wave, bananas: latest?.bananas, bestWave: stats.best });
@@ -800,6 +889,7 @@
   }
   function stop(reason = 'Остановлено. Бой поставлен на паузу.', keepGear = false) {
     active = false;
+    stoppedAt = Date.now(); clearFarmReport();
     fastRestartProbe = false;
     if (!keepGear && cfg.gearAuto) { cfg = { ...cfg, gearAuto: false }; saveConfig(); syncControls(); }
     requestAbort?.abort();
@@ -826,6 +916,9 @@
     }
     if (active) { render(); return true; }
     active = true; startedAt = Date.now(); progressAt = Date.now();
+    stoppedAt = 0; farmSessionComplete = false; farmSessionBase = stats.farmCycles;
+    farmCycleLimit = Number.isInteger(options.farmCycleLimit) ? Math.max(0, Math.min(100, options.farmCycleLimit)) : 0;
+    recordedFarmGeneration = null; clearFarmReport();
     fastRestartProbe = probing;
     if (!accountingStartedAt) accountingStartedAt = startedAt;
     errors = 0; backoff = 0; nextRequest = 0; recovering = false; failCount = 0;
@@ -848,6 +941,7 @@
     if (now - lastBridgeAt > 800) refreshBridge();
     if (!engine || !latest) return;
     if (cfg.sessionMinutes > 0 && now - startedAt >= cfg.sessionMinutes * 60000) return stop('Заданный сеанс завершён.');
+    if (farmExitPending) return;
     if (!['auto', 'farmer'].includes(cfg.mode) && cfg.targetWave > 0 && stats.best >= cfg.targetWave) return stop('Цель достигнута: сервер сохранил волну ' + stats.best + '.');
     disableBuiltinAuto();
     if (document.hidden) {
@@ -856,6 +950,7 @@
       return;
     }
     if (hiddenPause) { hiddenPause = false; progressAt = now; }
+    if (completeFarmSession()) return;
     if (cfg.mode === 'auto') {
       maintainDamage(now);
       const handled = await automaticStep(now);
@@ -900,7 +995,10 @@
       const plan = planForFarm(engine.wave, combat.speed, combat.farmKills);
       if (plan.kills > 0 && engine.killed >= plan.kills) {
         if (acceptedWave !== engine.wave.wave || acceptedKills < plan.kills) {
-          if (earlyReportedWave !== engine.wave) {
+          if (combat.farmTiming === 'spawn') {
+            if (earlyReportedWave !== engine.wave) { earlyReportedWave = engine.wave; farmConfirmStartedAt = now; }
+            scheduleFarmReport(plan);
+          } else if (earlyReportedWave !== engine.wave) {
             earlyReportedWave = engine.wave;
             farmConfirmStartedAt = now;
             if (reportKills) Promise.resolve().then(() => reportKills()).catch(() => {});
@@ -912,16 +1010,11 @@
           }
           return;
         }
+        if (combat.farmTiming === 'spawn' && fastFarmExit(plan, now)) return;
         const exit = visibleButton(text => text === 'ВЫЙТИ ИЗ ВОЛНЫ');
         if (exit && !pendingFail && now - farmRetreatAt > 250) {
           farmRetreatAt = now; actionAt = now + 100;
-          stats.farmCycles++;
-          farmCycles.push({ at: new Date().toISOString(), wave: engine.wave.wave,
-            kills: acceptedKills, targetKills: plan.kills,
-            reward: engine.wave.cats.slice(0, acceptedKills).reduce((sum, cat) => sum + cat.reward, 0),
-            seconds: trial ? Math.round((now - trial.startedAt) / 100) / 10 : null,
-            bananas: latest.bananas });
-          if (farmCycles.length > 100) farmCycles.shift();
+          if (!recordFarmCycle(plan, now)) return;
           exit.click(); note('Фарм: награда сохранена. Перезапускаю волну.');
         } else if (!exit) {
           visibleButton((text, b) => b.getAttribute('aria-label') === 'Пауза')?.click();
@@ -1011,6 +1104,10 @@
     stats.gained = latest && baselineBalance !== null ? latest.bananas - baselineBalance + stats.spent : 0;
     return {
       version: VERSION, active, config: { ...cfg }, message,
+      session: { startedAt, stoppedAt, cycles: stats.farmCycles - farmSessionBase, cycleLimit: farmCycleLimit, completed: farmSessionComplete },
+      transitioning: farmExitPending || pendingFail,
+      farmOffer: engine?.wave ? { wave: engine.wave.wave, gap: engine.wave.gap,
+        current: farmPrefix(engine.wave, 8, cfg.farmKills), elite: eliteFarmCandidate(engine.wave) } : null,
       automation: cfg.mode === 'auto' ? { ...automatic, history: automatic.history.slice(),
         combatMode: combatConfig().mode,
         nextAttemptSeconds: automatic.nextAttemptAt ? Math.max(0, Math.ceil((automatic.nextAttemptAt - Date.now()) / 1000)) : null,
