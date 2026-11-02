@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, mkdir, open, unlink, access } from 'node:fs/promises';
+import { readFile, access } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname, join, delimiter, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,13 +16,17 @@ import { createTelegramProvider, telegramCredentials } from './lib/telegram.mjs'
 import { gameAuthError, saveTelegramLaunch, withRenewedLaunch } from './lib/launch.mjs';
 import { createRankings } from './lib/leaderboard.mjs';
 import { createConsoleView } from './lib/terminal.mjs';
+import { acquireRuntime, currentStatus, requestStop } from './lib/runtime.mjs';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const stateDir = resolve(process.env.MAKAKA_STATE_DIR || join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'makaka-pilot'));
-const configPath = join(stateDir, 'launch.json'), lockPath = join(stateDir, 'running.json');
+const configPath = join(stateDir, 'launch.json');
 const telegramPath = join(stateDir, 'telegram.json');
-const stopPath = join(stateDir, 'stop.request'), statusPath = join(stateDir, 'status.json');
+const stopPath = join(stateDir, 'stop.request');
 const command = process.argv[2] || 'start';
+const scriptPath = fileURLToPath(import.meta.url);
+const { version } = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+let runtime;
 
 async function question(prompt, fallback, secret = false) {
   if (!process.stdin.isTTY) throw new Error('Для настройки открой Termux и выполни makaka login.');
@@ -58,8 +62,7 @@ async function telegramLogin() {
     console.log('Вход Telegram сохранён на телефоне. Ссылки будут обновляться автоматически. Запуск: makaka');
   } finally {
     await provider?.close().catch(() => {});
-    const owner = await readJson(lockPath).catch(() => null);
-    if (owner?.pid === process.pid) await unlink(lockPath).catch(() => {});
+    await runtime.close();
   }
 }
 
@@ -88,49 +91,49 @@ async function browserPath() {
   throw new Error('Chromium не найден. В Termux: pkg install x11-repo && pkg install chromium');
 }
 
-async function acquire() {
-  await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const handle = await open(lockPath, 'wx', 0o600);
-      await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-      await handle.close();
-      await unlink(stopPath).catch(e => { if (e.code !== 'ENOENT') throw e; });
-      return;
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      const other = await readJson(lockPath);
-      let alive = false;
-      if (Number.isInteger(other?.pid) && other.pid > 0) {
-        try { process.kill(other.pid, 0); alive = true; }
-        catch (err) { if (err.code !== 'ESRCH') alive = true; }
-      }
-      if (alive || attempt) throw new Error('Makaka уже запущена. Статус: makaka status. Остановить: makaka stop.');
-      await unlink(lockPath);
-    }
-  }
+async function acquire(onStatus, onStop) {
+  runtime = await acquireRuntime({ stateDir, script: scriptPath, onStatus, onStop,
+    initialStatus: { version, checkedAt: new Date().toISOString(), active: false,
+      message: 'Запускаю игровую сессию…' } });
+}
+
+async function stopRequested() {
+  const request = await readJson(stopPath, false);
+  return !!request && (!request.runId || request.runId === runtime?.owner.runId);
+}
+
+async function printStatus() {
+  const status = await currentStatus(stateDir, scriptPath);
+  const view = createConsoleView(); view.update(status); view.close();
 }
 
 async function run(checkOnly = false, tuning = false, probing = false, benchmarking = false) {
-  let config = await readJson(configPath);
-  if (!config?.url && config?.authMode !== 'telegram') { await login(); config = await readJson(configPath); }
-  if (command === 'farm') config = { ...config, options: farmSessionOptions(config.options) };
-  else if (!checkOnly && !tuning && !probing && !benchmarking) config = { ...config, options: automaticSessionOptions(config.options) };
-  let url = config.authMode === 'telegram' ? null : validateLaunchUrl(config.url);
-  const executablePath = await browserPath();
-  await acquire();
-  let browser, page, provider, view, stopping = false, last = null, terminalError = false, sessionDeadline = null;
+  let browser, page, provider, view, stopping = false, pageReady = false, refreshPending,
+    last = null, terminalError = false, sessionDeadline = null;
   const rankings = createRankings();
   const stop = () => { stopping = true; };
-  const stopped = async () => stopping || !!await readJson(stopPath, false);
+  const stopped = async () => stopping || await stopRequested();
+  const refreshStatus = async () => {
+    if (!pageReady || !page || page.isClosed()) return runtime.snapshot;
+    if (refreshPending) return refreshPending;
+    const currentPage = page;
+    refreshPending = (async () => {
+      const snapshot = safeStatus(await currentPage.evaluate(() => window.MakakaPilot.status()));
+      if (page !== currentPage || !pageReady) return runtime.snapshot;
+      last = await runtime.saveStatus({ ...snapshot, rankings: rankings.snapshot() });
+      return last;
+    })().finally(() => { refreshPending = null; });
+    return refreshPending;
+  };
+  await acquire(refreshStatus, stop);
   const closePage = async () => {
+    pageReady = false;
     if (page && !page.isClosed()) {
       try {
         const s = await page.evaluate(() => { window.MakakaPilot?.stop('Закрываю игровую сессию.'); return window.MakakaPilot?.status(); });
         if (s) {
-          const finalStatus = { ...safeStatus(s), rankings: rankings.snapshot() };
+          const finalStatus = await runtime.saveStatus({ ...safeStatus(s), rankings: rankings.snapshot() }, 'stopping');
           view?.update(finalStatus);
-          await privateJson(statusPath, finalStatus);
         }
       } catch {}
       view?.close(); view = null;
@@ -143,6 +146,12 @@ async function run(checkOnly = false, tuning = false, probing = false, benchmark
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   spawnSync('termux-wake-lock', [], { stdio: 'ignore' });
   try {
+    let config = await readJson(configPath);
+    if (!config?.url && config?.authMode !== 'telegram') { await login(); config = await readJson(configPath); }
+    if (command === 'farm') config = { ...config, options: farmSessionOptions(config.options) };
+    else if (!checkOnly && !tuning && !probing && !benchmarking) config = { ...config, options: automaticSessionOptions(config.options) };
+    let url = config.authMode === 'telegram' ? null : validateLaunchUrl(config.url);
+    const executablePath = await browserPath();
     if (config.authMode === 'telegram') provider = await createTelegramProvider(await readJson(telegramPath, {}));
     const { default: puppeteer } = await import('puppeteer-core');
     browser = await puppeteer.launch({ executablePath, headless: true, timeout: 45000,
@@ -196,10 +205,11 @@ async function run(checkOnly = false, tuning = false, probing = false, benchmark
         }
       },
       run: async () => {
+        pageReady = true;
         try {
           if (benchmarking && !stopping) {
             const result = await benchmarkFarm(page, { stopped: () => stopping,
-              readStop: async () => !!await readJson(stopPath, false) });
+              readStop: stopRequested });
             if (!result) { console.log('Сравнение остановлено. Настройки не изменены.'); return; }
             await privateJson(join(stateDir, 'benchmark.json'), result);
             if (result.improved) {
@@ -214,7 +224,7 @@ async function run(checkOnly = false, tuning = false, probing = false, benchmark
           }
           if (tuning && !stopping) {
             const ranked = await tuneFarm(page, { stopped: () => stopping,
-              readStop: async () => !!await readJson(stopPath, false) });
+              readStop: stopRequested });
             if (!ranked?.length) { console.log('Подбор остановлен. Настройки не изменены.'); return; }
             await privateJson(join(stateDir, 'tuning.json'), { measuredAt: new Date().toISOString(), samples: ranked });
             const fresh = await readJson(configPath, config);
@@ -226,7 +236,7 @@ async function run(checkOnly = false, tuning = false, probing = false, benchmark
           if (probing && !stopping) {
             console.log('Проверяю быстрые убийства и выход через паузу. Покупки, кликер и сбор выключены.');
             const result = await probeFastRestart(page, { stopped: () => stopping,
-              readStop: async () => !!await readJson(stopPath, false) });
+              readStop: stopRequested });
             await privateJson(join(stateDir, 'probe.json'), result);
             console.log(result.message);
             console.log(`Баланс до: ${result.before?.bananas ?? '?'}; после выхода: ${result.afterExit?.bananas ?? '?'}; после перезапуска: ${result.afterRestart?.bananas ?? '?'}.`);
@@ -249,11 +259,10 @@ async function run(checkOnly = false, tuning = false, probing = false, benchmark
             if (!browser.connected) throw new Error('Браузер завершился. Проверь ограничения фоновой работы Android.');
             if (provider && await provider.keepAlive()) throw gameAuthError();
             rankings.refresh(page).catch(() => {});
-            last = { ...safeStatus(await page.evaluate(() => window.MakakaPilot.status())), rankings: rankings.snapshot() };
-            await privateJson(statusPath, last);
+            last = await refreshStatus();
             view.update(last);
             if (checkOnly || stopping || !last.active || terminalError) break;
-            if (await readJson(stopPath, false)) { stopping = true; break; }
+            if (await stopRequested()) { stopping = true; break; }
             await delay(1000);
           } while (true);
           if (terminalError) throw gameAuthError();
@@ -264,8 +273,7 @@ async function run(checkOnly = false, tuning = false, probing = false, benchmark
     await closePage();
     await browser?.close().catch(() => {});
     await provider?.close().catch(() => {});
-    const owner = await readJson(lockPath).catch(() => null);
-    if (owner?.pid === process.pid) await unlink(lockPath).catch(() => {});
+    await runtime.close();
     spawnSync('termux-wake-unlock', [], { stdio: 'ignore' });
     process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
   }
@@ -275,13 +283,9 @@ try {
   if (command === 'login' || command === 'setup') await login();
   else if (command === 'telegram-login') await telegramLogin();
   else if (command === 'config') await configure();
-  else if (command === 'status') {
-    const status = await readJson(statusPath);
-    if (status) { const view = createConsoleView(); view.update(status); view.close(); }
-    else console.log('Пока нет сохранённого статуса. Запуск: makaka');
-  } else if (command === 'stop') {
-    if (!await readJson(lockPath)) console.log('Скрипт не запущен.');
-    else { await privateJson(stopPath, { requestedAt: new Date().toISOString() }); console.log('Запрос остановки отправлен.'); }
+  else if (command === 'status') await printStatus();
+  else if (command === 'stop') {
+    console.log(await requestStop(stateDir, scriptPath) ? 'Запрос остановки отправлен.' : 'Скрипт не запущен.');
   } else if (command === 'check') await run(true);
   else if (command === 'tune') await run(false, true);
   else if (command === 'probe') await run(false, false, true);
@@ -289,4 +293,8 @@ try {
   else if (command === 'start' || command === 'farm') await run();
   else if (command === 'doctor') console.log(`Node ${process.version}; Chromium: ${await browserPath()}; настройки: ${stateDir}`);
   else throw new Error('Команды: makaka [start|farm|telegram-login|login|config|tune|probe|bench|check|status|stop|doctor]');
-} catch (e) { console.error(redact(e.message)); process.exitCode = 1; }
+} catch (e) {
+  console.error(redact(e.message));
+  if (e.code === 'MAKAKA_RUNNING') await printStatus();
+  process.exitCode = 1;
+}

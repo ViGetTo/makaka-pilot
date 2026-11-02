@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Makaka Pilot
 // @namespace    local.makaka.pilot
-// @version      2.11.0
+// @version      2.11.1
 // @description  Автоматизация волн, улучшений и кликера для Макаки Убиваки.
 // @match        https://makaka.wivvi.net/*
 // @run-at       document-start
@@ -12,7 +12,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.11.0';
+  const VERSION = '2.11.1';
   const AUTO_INTERVAL = 180000, AUTO_TIMEOUT = 90000;
   const DEFAULTS = {
     mode: 'auto', speed: 8, autoUpgrade: true, mine: true,
